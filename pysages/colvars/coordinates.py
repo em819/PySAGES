@@ -9,6 +9,12 @@ from jax import numpy as np
 from jax.numpy import linalg
 import jax
 from pysages.colvars.core import AxisCV, TwoPointCV, multicomponent
+import jax.debug as jdb
+import time
+import logging
+
+#logging.basicConfig(level=logging.DEBUG)
+#jax.config.update('jax_log_compiles', True)
 
 
 def barycenter(positions):
@@ -180,13 +186,15 @@ class CoordinationNumber(TwoPointCV):
         self,
         indices, #list of tuples of indices list, first tuple includes all indices, second tuple those whose CN should be computed
         nbrs, #jax-md neighborlist (edge-list)
-        species, #element of every single particle (list)
+        species, #element of every single particle (list),
+        box, #Simulation box lengths (assumed constant)
         species_nn=None, #Optional, species for which CN should be computed (if none, element-independent CN is computed)
     ):
         #super().__init__(indices, group_length=2)
         super().__init__(indices)
         self.nbrs = nbrs
         self.species = species
+        self.box=box
         self.species_nn = species_nn
         self.indices_cn = np.array(list(indices[1]))
         #Construct subset of total radii_table for the species involved. Multiply covalent bond lengths by 1.6 to obtain critical/nearly broken lengths.
@@ -196,8 +204,25 @@ class CoordinationNumber(TwoPointCV):
         self.r0_lookup_table, self.element_to_index, self.element_ids_array, self.particle_to_lookup_idx = self.create_r0_lookup_table(self.r0_table_species, self.species)
         #print(f'indices_nn : {self.indices_nn}')
         #Estimate max number of neighbors from the current neighborlist; multiply by 1.5 to account for potential fluctuations 
-        self.number_nn_max = np.minimum( int(len(self.nbrs.idx[1][np.where(np.isin(self.nbrs.idx[0], indices[1][0]))]) * 1.5), len(species) )
-        print(f'Indices : {self.indices}')
+        #self.number_nn_max = np.minimum( int(len(self.nbrs.idx[1][np.where(np.isin(self.nbrs.idx[0], indices[1][0]))]) * 1.5), len(species) )
+        self.number_nn_max = np.minimum( int(self.determine_max_neighbors(self.nbrs, self.indices_cn) * 4.0), len(self.species) )
+
+
+    def determine_max_neighbors(self, edge_list_obj, particle_idxs):
+        edge_list = edge_list_obj.idx
+        def determine_num_neighbors(i, num_neighbor_list):
+            #num_neighbor_list[i] = np.size(np.where(edge_list[0] == particle_idxs[i], edge_list[1]))
+            n_n = np.sum(edge_list[1] == particle_idxs[i])
+            num_neighbor_list = num_neighbor_list.at[i].set(n_n)
+            return num_neighbor_list
+
+        n = len(particle_idxs)
+        num_neighbors = np.zeros(n, dtype=np.int32)
+        num_neighbors = jax.lax.fori_loop(0, n, determine_num_neighbors, num_neighbors)
+        #jdb.print('num_neighbors_list = {num_neighbors}', num_neighbors=num_neighbors)
+        #Return the biggest number of neighbors
+        return np.max(num_neighbors)
+
 
     def extract_r0_for_species(self, radii_table_default, species):
         unique_elements = np.unique(species)
@@ -233,89 +258,92 @@ class CoordinationNumber(TwoPointCV):
     @property
     def function(self):
         #return lambda r_all, r_cn: calculate_coordination_number(r_all, r_cn, self.nbrs, self.species, self.indices, self.number_nn)
-        return lambda r_all, r_cn: calculate_coordination_number(self.nbrs.idx, self.indices_cn, r_all, self.number_nn_max, self.r0_table_species, self.species, self.species_nn)
+        return lambda r_all, r_cn: calculate_coordination_number(self.nbrs, self.indices_cn, r_all, self.number_nn_max, self.r0_table_species, self.species, self.species_nn, self.box)
 
-def calculate_coordination_number(edge_list, indices_cn, all_positions, max_neighbors, r0_dict, all_species, species_nn):
-
+def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_neighbors, r0_dict, all_species, species_nn, box):
+#def calculate_coordination_number(edge_list, indices_cn, all_positions, max_neighbors, r0_dict, all_species, species_nn):
     n = len(indices_cn)
     N = all_positions.shape[0]
-    num_edges = edge_list.shape[1]
-    def get_neighbors_for_particle(particle_idx):
-        is_source = edge_list[0] == particle_idx
 
-        all_neighbors = np.where(is_source, edge_list[1], N)
+    #jdb.print('max_neighbors = {max_neighbors}', max_neighbors=max_neighbors)
+    #Update neighborlist
+    edge_list_obj = edge_list_obj.update(all_positions, neighbor=edge_list_obj.idx, box=box)
+    edge_list = edge_list_obj.idx
+    #jdb.print('edge_list : {edge_list}', edge_list=edge_list)
 
-        sorted_neighbors = np.sort(all_neighbors)
-        work_neighbors = sorted_neighbors[:max_neighbors]
+    #jdb.print(edge_list)
+    def get_all_neighbors():
+        # Create boolean mask for edges originating from our particles
+        #particle_mask = np.isin(edge_list[0], indices_cn)
 
-        is_different = np.concatenate([
-            np.array([True]),  # First element is always kept
-            np.diff(work_neighbors) > 0  # Keep if different from previous
-        ])
+        #unique_sources = indices_cn
+        #unique_targets = np.unique(np.where(particle_mask, edge_list[1], N), size=max_neighbors, fill_value=N)
 
-        is_valid = work_neighbors < N
-        #Only select those neighbors that have correct element
-        is_correct_species = True if species_nn == None else all_species[work_neighbors] == species_nn
-        keep_mask = is_different & is_valid & is_correct_species
-        final_neighbors = np.full(max_neighbors, -1)
+        all_neighbors = np.full((n, max_neighbors), -1, dtype=np.int32)
 
-        def place_neighbor(i, state):
-            final_neighbors, placed_count = state
+        def add_neighbor(i, state):
+            neighbors, counts = state
+            particle_idx = indices_cn[i]
 
-            # Check if we should place this neighbor
-            should_place = keep_mask[i] & (placed_count < max_neighbors)
-            neighbor_to_place = work_neighbors[i]
+            #Collect all unique neighbors for particle i
+            unique_targets_to_particle_i = np.unique(np.where(edge_list[1] == particle_idx, edge_list[0], -1), size=max_neighbors, fill_value=-1)
+            #jdb.print('unique targets : {unique_targets_to_particle_i}', unique_targets_to_particle_i=unique_targets_to_particle_i)
 
-            # Update the array at the current placed_count position
-            final_neighbors = np.where(
-                should_place & (np.arange(max_neighbors) == placed_count),
-                neighbor_to_place,
-                final_neighbors
-            )
+            mask = (unique_targets_to_particle_i >= 0) & (unique_targets_to_particle_i != particle_idx)
+            if species_nn is not None:
+                #If we only want the CN for specific neighboring elements (e.g hydrogen)
 
-            # Update count
-            placed_count = placed_count + should_place.astype(np.int32)
+                mask = mask  & all_species[unique_targets_to_particle_i] == species_nn
 
-            return final_neighbors, placed_count
+            filtered_targets = np.where(mask, unique_targets_to_particle_i, -1)
 
-        init_state = (final_neighbors, np.int32(0))
-        final_neighbors, actual_count = jax.lax.fori_loop(
-            0, max_neighbors, place_neighbor, init_state
-        )
+            # Count valid neighbors
+            valid_count = np.sum(filtered_targets >= 0)
 
-        return final_neighbors, actual_count
+            neighbors = neighbors.at[i].set(filtered_targets)
+            counts = counts.at[i].set(valid_count)
 
-    def compute_normalized_distances():
-        pass
+            return neighbors, counts
 
-    def compute_coordination_number(all_distances, r0_lookup=None, species_nn=None):
-       #First compute the normalized distances |Ri - Rj|/r_0
-       #normalized_distances = compute_normalized_distances(all_distances, r0_lookup, species_nn)
+        init_state = (all_neighbors, np.zeros(n, dtype=np.int32))
+        neighbors, counts = jax.lax.fori_loop(0, n, add_neighbor, init_state)
 
-       #For now, use global r0 value of 3A
-       normalized_distances = all_distances / 1.7
-       #Apply CN formula from colvars package with n=6 and m=12
-       cn = np.nansum( (1. - (normalized_distances)**6)/(1- (normalized_distances)**12) )
-       return cn
+        return neighbors, counts
 
+    # Get all neighbors
+    all_neighbor_indices, all_neighbor_counts = get_all_neighbors()
 
-    def compute_distances_for_particle(i):
-        particle_idx = indices_cn[i]
-        particle_pos = all_positions[particle_idx]
+    # Compute distances vectorized across all particles
+    particle_positions = all_positions[indices_cn]  # Shape: (n, 3)
 
-        neighbor_idxs, neighbor_count = get_neighbors_for_particle(particle_idx)
+    # Handle invalid neighbors safely
+    valid_mask = all_neighbor_indices >= 0
+    safe_neighbor_indices = np.where(valid_mask, all_neighbor_indices, 0)
 
-        valid_mask = neighbor_idxs >= 0
-        safe_neighbor_idxs = np.where(valid_mask, neighbor_idxs, 0)
-        neighbor_positions = all_positions[safe_neighbor_idxs]
+    # Get neighbor positions - shape: (n, max_neighbors, 3)
+    neighbor_positions = all_positions[safe_neighbor_indices]
 
-        diff = neighbor_positions - particle_pos[None, :]
-        distances = np.linalg.norm(diff, axis=1)
-        #masked_distances = np.where(valid_mask, distances, np.inf)
-        masked_distances = np.where(valid_mask, distances, np.nan)
+    # Compute differences - broadcasting over neighbor dimension
+    diff = neighbor_positions - particle_positions[:, None, :]  # Shape: (n, max_neighbors, 3)
 
-        return masked_distances, neighbor_idxs, neighbor_count
+    # Compute distances
+    distances = np.linalg.norm(diff, axis=2)  # Shape: (n, max_neighbors)
 
+    # Mask invalid distances
+    masked_distances = np.where(valid_mask, distances, np.nan)
 
-    all_distances, all_neighbor_indices, all_neighbor_counts = jax.vmap(compute_distances_for_particle)(np.arange(n))
-    return compute_coordination_number(all_distances)
+    # Compute coordination numbers
+    normalized_distances = masked_distances / 1.7
+    mask = ~np.isnan(normalized_distances)
+    numerator = 1.0 - normalized_distances**6
+    denominator = 1.0 - normalized_distances**12
+
+    cn_terms = np.where(mask, (1.0 - normalized_distances**6)/(1.0 - normalized_distances**12), 0.0)
+    cn_value = np.sum(cn_terms)
+
+    #jdb.print('CN : {cn_value}', cn_value=cn_value)
+    #jdb.print('NH2 coordinates : {pos}', pos=all_positions[np.array([1567, 1568, 1569])])
+    #jdb.print('all_neighbor_indices : {all_neighbor_indices}', all_neighbor_indices=all_neighbor_indices)
+    #jdb.print('Masked distances : {masked_distances}', masked_distances=masked_distances)
+    #jdb.breakpoint()
+    return cn_value
