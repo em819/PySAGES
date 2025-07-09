@@ -320,8 +320,11 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
     # Compute differences - broadcasting over neighbor dimension
     diff = neighbor_positions - particle_positions[:, None, :]  # Shape: (n, max_neighbors, 3)
 
+    #Apply minimal-image-convention (if non-PBC system, box should be [0.,0.,0.], assumes orthorhombic box)
+    half_box = box/2.0
+    diff_mic = np.remainder(diff + half_box, box) - half_box
     # Compute distances
-    distances = np.linalg.norm(diff, axis=2)  # Shape: (n, max_neighbors)
+    distances = np.linalg.norm(diff_mic, axis=2)  # Shape: (n, max_neighbors)
 
     # Mask invalid distances
     masked_distances = np.where(valid_mask, distances, np.nan)
