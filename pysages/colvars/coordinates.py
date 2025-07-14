@@ -189,6 +189,7 @@ class CoordinationNumber(TwoPointCV):
         species, #element of every single particle (list),
         box, #Simulation box lengths (assumed constant)
         species_nn=None, #Optional, species for which CN should be computed (if none, element-independent CN is computed)
+        cn_exponents=None, #Optional, tuple of exponents n and m for CN switching function definition
     ):
         #super().__init__(indices, group_length=2)
         super().__init__(indices)
@@ -197,6 +198,7 @@ class CoordinationNumber(TwoPointCV):
         self.box=box
         self.species_nn = species_nn
         self.indices_cn = np.array(list(indices[1]))
+        #jdb.print('indices_cn = {indices_cn}', indices_cn=self.indices_cn)
         #Construct subset of total radii_table for the species involved. Multiply covalent bond lengths by 1.6 to obtain critical/nearly broken lengths.
         #self.r0_table_species = {p: (radii_table_default[p[0]] + radii_table_default[p[1]]) * 1.6 for p in list(combinations(list(set(self.species))))}
         self.r0_table_species = self.extract_r0_for_species(self.radii_table_default, self.species)
@@ -205,6 +207,9 @@ class CoordinationNumber(TwoPointCV):
         #Estimate max number of neighbors from the current neighborlist; multiply by 1.5 to account for potential fluctuations 
         #self.number_nn_max = np.minimum( int(len(self.nbrs.idx[1][np.where(np.isin(self.nbrs.idx[0], indices[1][0]))]) * 1.5), len(species) )
         self.number_nn_max = np.minimum( int(self.determine_max_neighbors(self.nbrs, self.indices_cn) * 4.0), len(self.species) )
+        self.num_exp, self.denom_exp = cn_exponents if cn_exponents is not None else (6,12)
+        #jdb.print("n={n}",n=self.num_exp)
+        #jdb.print("m={m}", m=self.denom_exp)
 
 
     def determine_max_neighbors(self, edge_list_obj, particle_idxs):
@@ -256,9 +261,21 @@ class CoordinationNumber(TwoPointCV):
     @property
     def function(self):
         #return lambda r_all, r_cn: calculate_coordination_number(r_all, r_cn, self.nbrs, self.species, self.indices, self.number_nn)
-        return lambda r_all, r_cn: calculate_coordination_number(self.nbrs, self.indices_cn, r_all, self.number_nn_max, self.r0_lookup_table, self.particle_to_lookup_idx, self.species, self.species_nn, self.box)
+        return lambda r_all, r_cn: calculate_coordination_number(
+                self.nbrs, 
+                self.indices_cn, 
+                r_all, 
+                self.number_nn_max, 
+                self.r0_lookup_table, 
+                self.particle_to_lookup_idx, 
+                self.species,
+                self.species_nn,
+                self.box,
+                self.num_exp,
+                self.denom_exp
+                )
 
-def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_neighbors, r0_dict, element_to_local_index,all_species, species_nn, box):
+def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_neighbors, r0_dict, element_to_local_index,all_species, species_nn, box, num_exp, denom_exp):
 #def calculate_coordination_number(edge_list, indices_cn, all_positions, max_neighbors, r0_dict, all_species, species_nn):
     n = len(indices_cn)
     N = all_positions.shape[0]
@@ -344,9 +361,10 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
     #numerator = 1.0 - normalized_distances**6
     #denominator = 1.0 - normalized_distances**12
 
-    cn_terms = np.where(mask, (1.0 - normalized_distances**6)/(1.0 - normalized_distances**12), 0.0)
+    cn_terms = np.where(mask, (1.0 - normalized_distances**num_exp)/(1.0 - normalized_distances**denom_exp), 0.0)
     cn_value = np.sum(cn_terms)
 
+    #jdb.print('CN terms : {cn_terms}', cn_terms=cn_terms)
     #jdb.print('CN : {cn_value}', cn_value=cn_value)
     #jdb.print('NH2 coordinates : {pos}', pos=all_positions[np.array([1567, 1568, 1569])])
     #jdb.print('all_neighbor_indices : {all_neighbor_indices}', all_neighbor_indices=all_species[safe_neighbor_indices])
