@@ -4,6 +4,7 @@
 from jax import jit
 from jax import numpy as np
 from jax_md import dataclasses
+import numpy as nnp
 
 from pysages.backends.core import SamplingContext
 from pysages.backends.snapshot import (
@@ -122,12 +123,14 @@ def build_runner(context, sampler, jit_compile=True):
 
 
         def _run_body(i, input_states_and_snapshots):
-            context_state, snapshot, sampler_state = input_states_and_snapshots
+            context_state, snapshot, sampler_state, cv_arr = input_states_and_snapshots
             context_state, snapshot, sampler_state = step(context_state, snapshot, sampler_state)
 
             if sampler.callback:
                 sampler.callback(snapshot, sampler_state, i)
-            return (context_state, snapshot, sampler_state)
+
+            cv_arr = cv_arr.at[i].set(sampler_state.xi[0])
+            return (context_state, snapshot, sampler_state, cv_arr)
 
         run_body = jit(_run_body) if jit_compile else _run_body
     
@@ -140,10 +143,13 @@ def build_runner(context, sampler, jit_compile=True):
     if jit_compile:
         def run(timesteps):
             # TODO: Allow to optionally batch timesteps with `lax.fori_loop`
-
-            sampler.context_state, sampler.snapshot, sampler.state = jax.block_until_ready( 
-                    jax.lax.fori_loop(0, timesteps, jax_fn_container['run_fn'], (sampler.context_state, sampler.snapshot, sampler.state))
+            cv_per_step_arr = np.zeros((timesteps, len(sampler.state.xi[0]))) 
+            sampler.context_state, sampler.snapshot, sampler.state, cv_per_step_arr = jax.block_until_ready( 
+                    jax.lax.fori_loop(0, timesteps, jax_fn_container['run_fn'], (sampler.context_state, sampler.snapshot, sampler.state, cv_per_step_arr))
                 )
+
+            with open('cv_vs_timestep.txt', 'a') as cvf:
+                nnp.savetxt(cvf, cv_per_step_arr)
     else:
         def run(timesteps):
             # TODO: Allow to optionally batch timesteps with `lax.fori_loop`
