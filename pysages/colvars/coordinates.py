@@ -304,9 +304,11 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
             if species_nn is not None:
                 #If we only want the CN for specific neighboring elements (e.g hydrogen)
 
-                mask = mask  & all_species[unique_targets_to_particle_i] == species_nn
+                final_mask = all_species[unique_targets_to_particle_i] == species_nn & mask
+            else:
+                final_mask = mask
 
-            filtered_targets = np.where(mask, unique_targets_to_particle_i, -1)
+            filtered_targets = np.where(final_mask, unique_targets_to_particle_i, -1)
 
             # Count valid neighbors
             valid_count = np.sum(filtered_targets >= 0)
