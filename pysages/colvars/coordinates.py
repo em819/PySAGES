@@ -304,7 +304,7 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
             if species_nn is not None:
                 #If we only want the CN for specific neighboring elements (e.g hydrogen)
 
-                final_mask = all_species[unique_targets_to_particle_i] == species_nn & mask
+                final_mask = (all_species[unique_targets_to_particle_i] == species_nn) & mask
             else:
                 final_mask = mask
 
@@ -369,7 +369,9 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
     #jdb.print('CN terms : {cn_terms}', cn_terms=cn_terms)
     #jdb.print('CN : {cn_value}', cn_value=cn_value)
     #jdb.print('NH2 coordinates : {pos}', pos=all_positions[np.array([1567, 1568, 1569])])
-    #jdb.print('all_neighbor_indices : {all_neighbor_indices}', all_neighbor_indices=all_species[safe_neighbor_indices])
-    #jdb.print('Masked distances : {masked_distances}', masked_distances=normalized_distances)
+    #jdb.print('all_neighbor_indices (species): {all_neighbor_indices}', all_neighbor_indices=all_species[safe_neighbor_indices])
+    #jdb.print('all_neighbor_indices: {all_neighbor_indices}', all_neighbor_indices=all_neighbor_indices)
+    #jdb.print('Masked distances : {masked_distances}', masked_distances=diff)
+    #jdb.print('r0_dict : {r0_dict}', r0_dict=r0_dict)
     #jdb.breakpoint()
     return cn_value
