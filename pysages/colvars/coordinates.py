@@ -195,7 +195,7 @@ class CoordinationNumber(TwoPointCV):
         super().__init__(indices)
         self.nbrs = nbrs
         self.species = species
-        self.box=box
+        self.box=box if np.any(box) else None
         self.species_nn = species_nn
         self.indices_cn = np.array(list(indices[1]))
         #jdb.print('indices_cn = {indices_cn}', indices_cn=self.indices_cn)
@@ -340,8 +340,11 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions, max_
     diff = neighbor_positions - particle_positions[:, None, :]  # Shape: (n, max_neighbors, 3)
 
     #Apply minimal-image-convention (if non-PBC system, box should be [0.,0.,0.], assumes orthorhombic box)
-    half_box = box/2.0
-    diff_mic = np.remainder(diff + half_box, box) - half_box
+    if box is not None:
+        half_box = box/2.0
+        diff_mic = np.remainder(diff + half_box, box) - half_box
+    else:
+        diff_mic = diff
     # Compute distances
     distances = np.linalg.norm(diff_mic, axis=2)  # Shape: (n, max_neighbors)
 
