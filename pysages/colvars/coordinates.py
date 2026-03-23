@@ -8,7 +8,7 @@ Collective Variables that are computed from the Cartesian coordinates.
 from jax import numpy as np
 from jax.numpy import linalg
 import jax
-from pysages.colvars.core import AxisCV, TwoPointCV, multicomponent
+from pysages.colvars.core import AxisCV, TwoPointCV, multicomponent, FourPointCV
 import jax.debug as jdb
 import time
 import logging
@@ -113,6 +113,14 @@ def distance(r1, r2):
     """
 
     return linalg.norm(r1 - r2)
+
+class DifferenceOfDistances(FourPointCV):
+    def __init__(self, indices):
+        super().__init__(indices)
+
+    @property
+    def function(self):
+        return lambda p1, p2, p3, p4: distance(p1, p2) - distance(p3, p4)
 
 
 @multicomponent
