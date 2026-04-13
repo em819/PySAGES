@@ -115,7 +115,12 @@ class DifferenceOfDistances(FourPointCV):
 
     @property
     def function(self):
-        return lambda p1, p2, p3, p4: distance(p1, p2) - distance(p3, p4)
+        if len(self.groups) == 0:
+            return lambda p1, p2, p3, p4: distance(p1, p2) - distance(p3, p4)
+        return lambda p1, p2, p3, p4: (
+            distance(barycenter(p1), barycenter(p2))
+            - distance(barycenter(p3), barycenter(p4))
+        )
 
 
 @multicomponent
