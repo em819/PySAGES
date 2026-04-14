@@ -38,6 +38,8 @@ class Snapshot(NamedTuple):
 
     #Optional thermostat parameters
     chain_data : Optional[dict[str,Any]] = None
+    barostat_data : Optional[dict[str,Any]] = None
+    npt_box_data : Optional[dict[str,Any]] = None
 
     def __repr__(self):
         return "PySAGES " + type(self).__name__

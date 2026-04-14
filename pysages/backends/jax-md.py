@@ -44,30 +44,71 @@ def take_snapshot(state, box, dt):
     vel_mass = (velocities, masses)
     origin = tuple(0.0 for _ in range(dims))
 
-    if state.chain:
-        chain_data = vars(state.chain)
-    else:
-        chain_data = None
+    # Support NVT (.chain), NPT (.thermostat), and NVE (no chain)
+    chain = getattr(state, 'chain', None) or getattr(state, 'thermostat', None)
+    chain_data = vars(chain) if chain else None
+
+    # Capture barostat state for NPT ensembles
+    barostat = getattr(state, 'barostat', None)
+    barostat_data = vars(barostat) if barostat else None
+
+    # Capture NPT box deformation variables
+    npt_box_data = None
+    if hasattr(state, 'reference_box'):
+        npt_box_data = {
+            'reference_box': state.reference_box,
+            'box_position': state.box_position,
+            'box_momentum': state.box_momentum,
+            'box_mass': state.box_mass,
+        }
 
     check_device_array(positions)  # currently, we only support `DeviceArray`s
 
-    return Snapshot(positions, vel_mass, forces, ids, None, Box(box, origin), dt, chain_data=chain_data)
+    return Snapshot(positions, vel_mass, forces, ids, None, Box(box, origin), dt,
+                    chain_data=chain_data, barostat_data=barostat_data,
+                    npt_box_data=npt_box_data)
 
 
-def update_snapshot(snapshot, state):
+def update_snapshot(snapshot, state, box=None):
     _, masses = snapshot.vel_mass
     positions = state.position
     vel_mass = (state.velocity, masses)
     forces = state.force
-    if state.chain:
-        chain_data = vars(state.chain)
-        return snapshot._replace(
-                positions=positions,
-                vel_mass=vel_mass,
-                forces=forces,
-                chain_data=chain_data)
-    else:
-        return snapshot._replace(positions=positions, vel_mass=vel_mass, forces=forces)
+
+    # Support NVT (.chain), NPT (.thermostat), and NVE (no chain)
+    chain = getattr(state, 'chain', None) or getattr(state, 'thermostat', None)
+    chain_data = vars(chain) if chain else None
+
+    # Capture barostat state for NPT ensembles
+    barostat = getattr(state, 'barostat', None)
+    barostat_data = vars(barostat) if barostat else None
+
+    # Capture NPT box deformation variables
+    npt_box_data = None
+    if hasattr(state, 'reference_box'):
+        npt_box_data = {
+            'reference_box': state.reference_box,
+            'box_position': state.box_position,
+            'box_momentum': state.box_momentum,
+            'box_mass': state.box_mass,
+        }
+
+    replacements = dict(
+        positions=positions,
+        vel_mass=vel_mass,
+        forces=forces,
+        chain_data=chain_data,
+        barostat_data=barostat_data,
+        npt_box_data=npt_box_data,
+    )
+
+    # Update box if provided (needed for NPT where box evolves)
+    if box is not None:
+        dims = box.shape[0]
+        origin = tuple(0.0 for _ in range(dims))
+        replacements['box'] = Box(box, origin)
+
+    return snapshot._replace(**replacements)
 
 
 def build_snapshot_methods(context, sampling_method):
@@ -109,7 +150,10 @@ def build_runner(context, sampler, jit_compile=True):
         def _step(sampling_context_state, snapshot, sampler_state):
             sampling_context_state = step_fn(sampling_context_state)  # jax_md simulation step
             context_state = sampling_context_state.state
-            snapshot = update_snapshot(snapshot, context_state)
+            # Extract box from extras (needed for NPT where box evolves each step)
+            extras = sampling_context_state.extras
+            box_from_extras = extras.get("box") if extras else None
+            snapshot = update_snapshot(snapshot, context_state, box=box_from_extras)
             sampler_state = sampler.update(snapshot, sampler_state)  # pysages update
             if sampler_state.bias is not None:  # bias the simulation
                 context_state = sampling_context_state.state
