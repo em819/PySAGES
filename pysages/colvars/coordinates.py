@@ -109,6 +109,48 @@ def distance(r1, r2):
 
     return linalg.norm(r1 - r2)
 
+
+def _box_edges(box):
+    """Normalize `box` to a 1D array of orthorhombic edge lengths."""
+    return box if box.ndim <= 1 else np.diag(box)
+
+
+def distance_pbc(r1, r2, box):
+    """
+    Minimum-image distance between two points under orthorhombic PBC.
+
+    Parameters
+    ----------
+    r1, r2: jax.Array
+        Positions (or group barycenters) in space.
+    box: jax.Array
+        Scalar, shape-(3,) array, or shape-(3,3) diagonal matrix giving the
+        box edge lengths. Triclinic boxes are not handled by this helper.
+    """
+    L = _box_edges(box)
+    d = r1 - r2
+    d = d - L * np.round(d / L)
+    return linalg.norm(d)
+
+
+def barycenter_pbc(positions, box):
+    """
+    PBC-aware geometric center for a group of points.
+
+    Displacements of every atom in the group are measured relative to
+    ``positions[0]`` under the minimum-image convention, averaged, then the
+    anchor is added back. Correct whenever every atom in the group lies
+    within half a box from the first atom — a safe assumption for molecular
+    groups (bond lengths ≪ L/2). For groups whose atoms span more than L/2
+    a more sophisticated algorithm would be required.
+    """
+    L = _box_edges(box)
+    anchor = positions[0]
+    disps = positions - anchor
+    disps = disps - L * np.round(disps / L)
+    return anchor + disps.mean(axis=0)
+
+
 class DifferenceOfDistances(FourPointCV):
     def __init__(self, indices):
         super().__init__(indices)
@@ -120,6 +162,74 @@ class DifferenceOfDistances(FourPointCV):
         return lambda p1, p2, p3, p4: (
             distance(barycenter(p1), barycenter(p2))
             - distance(barycenter(p3), barycenter(p4))
+        )
+
+
+class DistancePBC(TwoPointCV):
+    """
+    Minimum-image distance between two atoms (or group barycenters) under
+    orthorhombic periodic boundary conditions.
+
+    Safe to use with HarmonicBias / CVRestraints across box boundaries,
+    provided the restrained range stays well below L/2 on every axis. Group
+    barycenters are computed with minimum-image reference to the first atom
+    of each group, so groups that span a boundary are handled correctly
+    as long as intra-group atomic distances stay below L/2 (typical for
+    bonded molecular groups).
+
+    Parameters
+    ----------
+    indices: list[int], list[tuple(int)]
+       Two atom indices, or two groups of atoms.
+    box: scalar, shape-(3,) array, or shape-(3,3) diagonal matrix
+       Orthorhombic box edge lengths. Fixed at construction — assumes an
+       invariant box (NVT / NVE).
+    """
+
+    def __init__(self, indices, box):
+        super().__init__(indices)
+        self.box = np.asarray(box, dtype=float)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        box = self.box
+        if len(self.groups) == 0:
+            return lambda r1, r2: distance_pbc(r1, r2, box)
+        return lambda r1, r2: distance_pbc(
+            barycenter_pbc(r1, box), barycenter_pbc(r2, box), box
+        )
+
+
+class DifferenceOfDistancesPBC(FourPointCV):
+    """
+    d(p1, p2) - d(p3, p4) using minimum-image distances under orthorhombic
+    PBC. Multi-atom group barycenters use the same PBC-aware algorithm as
+    :class:`DistancePBC`.
+
+    Parameters
+    ----------
+    indices: list[int], list[tuple(int)]
+       Four atom indices (or four groups).
+    box: scalar, shape-(3,) array, or shape-(3,3) diagonal matrix
+       Orthorhombic box edge lengths (fixed at construction).
+    """
+
+    def __init__(self, indices, box):
+        super().__init__(indices)
+        self.box = np.asarray(box, dtype=float)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        box = self.box
+        if len(self.groups) == 0:
+            return lambda p1, p2, p3, p4: (
+                distance_pbc(p1, p2, box) - distance_pbc(p3, p4, box)
+            )
+        return lambda p1, p2, p3, p4: (
+            distance_pbc(barycenter_pbc(p1, box), barycenter_pbc(p2, box), box)
+            - distance_pbc(barycenter_pbc(p3, box), barycenter_pbc(p4, box), box)
         )
 
 

@@ -11,7 +11,14 @@ PySAGES with your own.
 """
 
 from .angles import Angle, DihedralAngle
-from .coordinates import Component, Displacement, Distance, DifferenceOfDistances
+from .coordinates import (
+    Component,
+    DifferenceOfDistances,
+    DifferenceOfDistancesPBC,
+    Displacement,
+    Distance,
+    DistancePBC,
+)
 from .shape import (
     Acylindricity,
     Asphericity,
