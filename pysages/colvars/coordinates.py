@@ -303,6 +303,7 @@ class CoordinationNumber(TwoPointCV):
         species_nn=None,
         cn_exponents=None,
         indices_nn=None,
+        switching_function='stable',
     ):
         """
         Coordination Number Collective Variable.
@@ -327,6 +328,20 @@ class CoordinationNumber(TwoPointCV):
             partners. When None (default), all atoms are candidates.
             When specified, only atoms in indices_nn are counted as neighbors.
             Works as an AND filter with species_nn if both are set.
+        switching_function : {'stable', 'legacy'}, optional
+            Which form of the rational switching function to use. Default 'stable'.
+
+            - 'stable' uses the algebraic identity
+                  1 - r^m = (1 - r^n) * sum_{k=0}^{K-1} r^(k*n),  K = m/n
+              so that (1 - r^n)/(1 - r^m) = 1 / sum_{k=0}^{K-1} r^(k*n). The 0/0
+              at r = 1 is cancelled before differentiation, giving a smooth,
+              finite jax.grad everywhere. Requires m to be an integer multiple
+              of n.
+            - 'legacy' uses the naive form (1 - r^n) / (1 - r^m + 1e-30). The
+              forward value is stable, but jax.grad returns NaN for r within a
+              few ulps of 1, which can silently break biased MD (see morpholine
+              decomposition incident, 2026-04-21). Kept for reproducing older
+              results.
         """
         super().__init__(indices)
         self.nbrs = nbrs
@@ -353,6 +368,22 @@ class CoordinationNumber(TwoPointCV):
         self.r0_lookup_table, self.element_to_index, self.element_ids_array, self.particle_to_lookup_idx = self.create_r0_lookup_table(self.r0_table_species, self.species)
         self.number_nn_max = np.minimum(int(self.determine_max_neighbors(self.nbrs, self.indices_cn) * 4.0), len(self.species))
         self.num_exp, self.denom_exp = cn_exponents if cn_exponents is not None else (6, 12)
+
+        if switching_function not in ('stable', 'legacy'):
+            raise ValueError(
+                f"switching_function={switching_function!r} must be 'stable' or 'legacy'."
+            )
+        # The 'stable' form is only valid when m is an integer multiple of n (so the
+        # (1 - r^n) factor can be cancelled analytically). All standard CN exponent
+        # pairs in the literature satisfy this ((6,12), (6,18), (6,30), (8,16), ...).
+        if switching_function == 'stable' and self.denom_exp % self.num_exp != 0:
+            raise ValueError(
+                f"cn_exponents=(n={self.num_exp}, m={self.denom_exp}) must satisfy "
+                "m % n == 0 for switching_function='stable'. Either pick exponents with "
+                "m a multiple of n, or pass switching_function='legacy' (not recommended; "
+                "its jax.grad is NaN near r = r0)."
+            )
+        self.switching_function = switching_function
 
 
     def determine_max_neighbors(self, edge_list_obj, particle_idxs):
@@ -419,12 +450,13 @@ class CoordinationNumber(TwoPointCV):
                 self.num_exp,
                 self.denom_exp,
                 self.nn_mask,
+                self.switching_function,
                 )
 
 def calculate_coordination_number(edge_list_obj, indices_cn, all_positions,
                                    max_neighbors, r0_dict, element_to_local_index,
                                    all_species, species_nn, box, num_exp, denom_exp,
-                                   nn_mask):
+                                   nn_mask, switching_function='stable'):
     """
     Compute coordination number using a smooth switching function.
 
@@ -503,7 +535,6 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions,
         diff_mic = diff
 
     distances = np.linalg.norm(diff_mic, axis=2)  # Shape: (n, max_neighbors)
-    masked_distances = np.where(valid_mask, distances, np.nan)
 
     def normalize_distances(distances, r0_table, element_ids_center, element_ids_neighbors):
         reference_distances = r0_table[element_ids_center[:, None], element_ids_neighbors]
@@ -511,15 +542,50 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions,
 
     element_ids_center = element_to_local_index[all_species[indices_cn]]
     element_ids_neighbors = element_to_local_index[all_species[safe_neighbor_indices]]
-    normalized_distances = normalize_distances(masked_distances, r0_dict, element_ids_center, element_ids_neighbors)
-    mask = ~np.isnan(normalized_distances)
+    normalized_distances = normalize_distances(distances, r0_dict, element_ids_center, element_ids_neighbors)
 
-    # Switching function with epsilon to avoid 0/0 singularity at r_norm=1.0
-    # and preserve correct gradient flow through JAX autodiff
-    cn_terms = np.where(
-        mask,
-        (1.0 - normalized_distances**num_exp) / (1.0 - normalized_distances**denom_exp + 1e-30),
-        0.0)
-    cn_value = np.sum(cn_terms)
+    if switching_function == 'stable':
+        # Replace padding slots with a safe finite r_norm so both the forward value and
+        # the autodiff gradient stay finite everywhere. Writing NaN for padding and
+        # relying on np.where to filter it out is not gradient-safe: JAX's where VJP
+        # multiplies the unselected branch's cotangent by 0, but 0 * NaN = NaN, so
+        # padding entries contaminate the Jacobian.
+        safe_r_norm = np.where(valid_mask, normalized_distances, 2.0)
+
+        # Gradient-stable rational switching function using the identity
+        #   1 - r^m = (1 - r^n) * sum_{k=0}^{K-1} r^(k*n),   K = m / n
+        # so that (1 - r^n) / (1 - r^m) = 1 / sum_{k=0}^{K-1} r^(k*n). The cancellation
+        # is done analytically before differentiation, so jax.grad gives a smooth and
+        # finite derivative even at r = 1 (where the naive form's autodiff is NaN).
+        K = denom_exp // num_exp
+        r_n = safe_r_norm ** num_exp
+        denom = np.ones_like(r_n)
+        r_k = np.ones_like(r_n)
+        for _ in range(K - 1):
+            r_k = r_k * r_n
+            denom = denom + r_k
+        cn_per_neighbor = 1.0 / denom
+
+        # valid_mask is a fixed neighbor-list padding mask independent of positions, so
+        # multiplying through it zeros out padding contributions in both the forward
+        # pass and the Jacobian without any NaN flow.
+        cn_value = np.sum(cn_per_neighbor * valid_mask)
+    else:
+        # 'legacy' branch: original PLUMED-style rational form. Forward values are fine,
+        # but jax.grad returns NaN when any r_norm is within ~1e-8 of 1.0, which can
+        # silently blow up biased simulations (morpholine decomposition, 2026-04-21).
+        # Retained for reproducing older results only.
+        masked_distances = np.where(valid_mask, distances, np.nan)
+        normalized_distances = normalize_distances(
+            masked_distances, r0_dict, element_ids_center, element_ids_neighbors
+        )
+        mask = ~np.isnan(normalized_distances)
+        cn_terms = np.where(
+            mask,
+            (1.0 - normalized_distances**num_exp)
+            / (1.0 - normalized_distances**denom_exp + 1e-30),
+            0.0,
+        )
+        cn_value = np.sum(cn_terms)
 
     return cn_value
