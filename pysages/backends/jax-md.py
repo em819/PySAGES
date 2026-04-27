@@ -143,6 +143,7 @@ jax_fn_container = {'is_defined': False, 'run_fn': None}
 
 def build_runner(context, sampler, jit_compile=True):
     step_fn = context.step_fn
+    dt = context.dt
 
     if not jax_fn_container['is_defined']:
         jax_fn_container['is_defined'] = True
@@ -157,8 +158,18 @@ def build_runner(context, sampler, jit_compile=True):
             sampler_state = sampler.update(snapshot, sampler_state)  # pysages update
             if sampler_state.bias is not None:  # bias the simulation
                 context_state = sampling_context_state.state
+                # Missing 2nd-half momentum kick from the bias: jax-md's
+                # velocity_verlet overwrites state.force with the unbiased
+                # force after the position update, so without this kick the
+                # bias contributes only the next step's 1st half-kick — i.e.,
+                # 0.5*dt per MD step instead of dt. Adding 0.5*dt*bias here
+                # plus the leading-half kick on the next step (via state.force
+                # below) restores a full dt kick per step.
+                new_momentum = context_state.momentum + 0.5 * dt * sampler_state.bias
                 biased_forces = context_state.force + sampler_state.bias
-                context_state = dataclasses.replace(context_state, force=biased_forces)
+                context_state = dataclasses.replace(
+                    context_state, momentum=new_momentum, force=biased_forces,
+                )
                 sampling_context_state = sampling_context_state._replace(state=context_state)
             return sampling_context_state, snapshot, sampler_state
 
