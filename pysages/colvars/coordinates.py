@@ -233,6 +233,69 @@ class DifferenceOfDistancesPBC(FourPointCV):
         )
 
 
+class MeanOfDistances(FourPointCV):
+    """
+    Mean of two distances, (d(p1, p2) + d(p3, p4)) / 2.
+
+    Analogous to :class:`DifferenceOfDistances` but symmetric: useful as a
+    reaction-progress coordinate where two bonds form/break together (e.g. the
+    two forming C-C bonds of a Diels-Alder reaction). Returns the *mean* rather
+    than the raw sum so it stays in single-bond-length units, on the same scale
+    as the companion difference CV. Multi-atom groups use geometric-center
+    (barycenter) distances.
+
+    Parameters
+    ----------
+    indices: list[int], list[tuple(int)]
+       Four atom indices (or four groups).
+    """
+
+    def __init__(self, indices):
+        super().__init__(indices)
+
+    @property
+    def function(self):
+        if len(self.groups) == 0:
+            return lambda p1, p2, p3, p4: 0.5 * (distance(p1, p2) + distance(p3, p4))
+        return lambda p1, p2, p3, p4: 0.5 * (
+            distance(barycenter(p1), barycenter(p2))
+            + distance(barycenter(p3), barycenter(p4))
+        )
+
+
+class MeanOfDistancesPBC(FourPointCV):
+    """
+    Mean of two distances, (d(p1, p2) + d(p3, p4)) / 2, using minimum-image
+    distances under orthorhombic PBC. Multi-atom group barycenters use the same
+    PBC-aware algorithm as :class:`DistancePBC`. See :class:`MeanOfDistances`
+    for the (non-PBC) rationale.
+
+    Parameters
+    ----------
+    indices: list[int], list[tuple(int)]
+       Four atom indices (or four groups).
+    box: scalar, shape-(3,) array, or shape-(3,3) diagonal matrix
+       Orthorhombic box edge lengths (fixed at construction).
+    """
+
+    def __init__(self, indices, box):
+        super().__init__(indices)
+        self.box = np.asarray(box, dtype=float)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        box = self.box
+        if len(self.groups) == 0:
+            return lambda p1, p2, p3, p4: 0.5 * (
+                distance_pbc(p1, p2, box) + distance_pbc(p3, p4, box)
+            )
+        return lambda p1, p2, p3, p4: 0.5 * (
+            distance_pbc(barycenter_pbc(p1, box), barycenter_pbc(p2, box), box)
+            + distance_pbc(barycenter_pbc(p3, box), barycenter_pbc(p4, box), box)
+        )
+
+
 @multicomponent
 class Displacement(TwoPointCV):
     """

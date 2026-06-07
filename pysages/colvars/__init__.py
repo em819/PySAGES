@@ -18,6 +18,8 @@ from .coordinates import (
     Displacement,
     Distance,
     DistancePBC,
+    MeanOfDistances,
+    MeanOfDistancesPBC,
 )
 from .shape import (
     Acylindricity,
