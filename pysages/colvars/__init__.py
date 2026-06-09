@@ -20,6 +20,8 @@ from .coordinates import (
     DistancePBC,
     MeanOfDistances,
     MeanOfDistancesPBC,
+    RelativeComponent,
+    RelativeComponentPBC,
 )
 from .shape import (
     Acylindricity,

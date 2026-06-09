@@ -72,6 +72,126 @@ class Component(AxisCV):
         return lambda rs: barycenter(rs)[self.axis]
 
 
+class RelativeComponent(AxisCV):
+    """
+    Cartesian-axis component of one group's barycenter measured *relative to* a
+    second (reference) group's barycenter::
+
+        xi = barycenter(group_1)[axis] - barycenter(group_2)[axis]
+
+    Unlike :class:`Component` (an absolute lab-frame coordinate), this CV is
+    invariant under a rigid translation of the whole system. Consequently an
+    enhanced-sampling bias acting on it exerts *no net force* on the center of
+    mass: the CV gradient is ``+1/N_1`` on the first group's atoms and
+    ``-1/N_2`` on the second group's atoms, which sums to zero. This removes the
+    center-of-mass drift that a bias on an absolute-coordinate CV (such as
+    :class:`Component`) produces under ABF / Metadynamics.
+
+    Typical use (interfacial transfer PMF): ``group_1`` = the solute,
+    ``group_2`` = the whole system (or all solvent), ``axis = 2``. The CV is then
+    the solute's z position relative to the system centroid, which itself
+    barely moves because the solute is a small fraction of the total mass.
+
+    Parameters
+    ----------
+    indices: list[tuple(int)], list[list[int]]
+        Exactly two groups. The first is the moving (solute) group, the second
+        is the reference group. Each group is a nested list / tuple / range of
+        atom indices (so both groups are passed as nested sequences, e.g.
+        ``[[0, 1, 2], [3, 4, ..., N-1]]``).
+    axis: int
+        Cartesian component requested as CV: ``0`` (X), ``1`` (Y), ``2`` (Z).
+
+    Notes
+    -----
+    Uses the unweighted geometric centroid (:func:`barycenter`), matching
+    :class:`Component`. No periodic unwrapping is applied: the jax-md backend
+    returns the stored (effectively wrapped) coordinates as-is — unlike the
+    HOOMD/LAMMPS backends, it ignores ``requires_box_unwrapping``. This is fine
+    here because (i) the plain mean is the *correct* reference for a group that
+    spans the box (a minimum-image barycenter is ill-defined for a box-spanning
+    group), and (ii) the zero-sum-gradient / COM-conservation property is exact
+    regardless of wrapping. The two PBC hazards are a *compact* group straddling
+    a periodic seam (its plain-mean centroid becomes meaningless) and the
+    centroid--centroid separation crossing L/2 (the CV jumps by L). Keep compact
+    groups away from the seam and the sampled separation below L/2 — e.g. via
+    soft walls — or use a PBC-aware variant. Pick a reference group
+    large/symmetric enough that its centroid is stable (the full system is the
+    safe default); a small reference group would couple the CV to its own
+    fluctuations.
+    """
+
+    def __init__(self, indices, axis):
+        super().__init__(indices, axis, group_length=2)
+
+    @property
+    def function(self):
+        axis = self.axis
+        return lambda r1, r2: barycenter(r1)[axis] - barycenter(r2)[axis]
+
+
+class RelativeComponentPBC(AxisCV):
+    """
+    PBC-robust version of :class:`RelativeComponent`::
+
+        xi = minimum_image( barycenter_pbc(grp1)[axis] - barycenter(grp2)[axis] )
+
+    along a single axis under orthorhombic PBC. Compared with the plain
+    :class:`RelativeComponent`, this variant is correct and continuous even when
+    the moving group straddles a periodic seam or when the centroid--centroid
+    separation approaches L/2:
+
+    - ``grp1`` (the compact, moving group, e.g. the solute) is made whole with
+      the anchor-relative minimum-image barycenter (:func:`barycenter_pbc`), so
+      its centroid is meaningful even if its atoms wrap across a boundary.
+    - ``grp2`` (the reference) uses the plain unweighted mean
+      (:func:`barycenter`). This is intentional: a minimum-image barycenter is
+      ill-defined for a group that *legitimately spans the box* (e.g. the whole
+      system / all solvent), so the reference must NOT be folded.
+    - The centroid--centroid separation is wrapped to ``(-L/2, L/2]`` so the CV
+      never jumps by L when the moving group crosses the seam.
+
+    The translation-invariance / zero-net-COM-force property of
+    :class:`RelativeComponent` is preserved: ``round`` has zero gradient a.e., so
+    the CV gradient is still ``+1/N_1`` on grp1 and ``-1/N_2`` on grp2 and sums
+    to zero.
+
+    Parameters
+    ----------
+    indices: list[tuple(int)], list[list[int]]
+        Exactly two groups: ``grp1`` (moving/compact) then ``grp2`` (reference).
+    axis: int
+        Cartesian component: ``0`` (X), ``1`` (Y), ``2`` (Z).
+    box: scalar, shape-(3,) array, or shape-(3,3) diagonal matrix
+        Orthorhombic box edge lengths. Fixed at construction — assumes an
+        invariant box (NVT / NVE).
+
+    Notes
+    -----
+    ``grp1`` must be compact (intra-group atomic separations < L/2) for the
+    anchor-relative wholeness to be valid — true for any molecular solute.
+    ``grp2`` is treated as the box-spanning reference; do not pass a compact
+    group that can itself straddle the seam as ``grp2``.
+    """
+
+    def __init__(self, indices, axis, box):
+        super().__init__(indices, axis, group_length=2)
+        self.box = np.asarray(box, dtype=float)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        box = self.box
+        axis = self.axis
+        L = _box_edges(box)[axis]
+
+        def f(r1, r2):
+            d = barycenter_pbc(r1, box)[axis] - barycenter(r2)[axis]
+            return d - L * np.round(d / L)
+
+        return f
+
+
 class Distance(TwoPointCV):
     """
     Use the distance of atom groups selected via the indices as collective variable.
