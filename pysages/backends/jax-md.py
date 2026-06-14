@@ -18,6 +18,21 @@ from pysages.typing import Callable, NamedTuple
 from pysages.utils import check_device_array, copy
 import jax.lax
 
+# PySAGES forces `jax_enable_x64` on (pysages/__init__.py), so the default float is
+# float64 -- the dtype every sampling method initializes its state with via bare
+# `np.zeros(...)`. When the jax-md integrator runs in float32 (e.g. so3lr_dev's
+# `precision: "float32"`), its snapshot arrays must be promoted to this canonical
+# float before reaching the methods, otherwise fields a method recomputes from the
+# snapshot (e.g. ABF's `Wp`) come back float32 and flip the `fori_loop` carry dtype.
+# This keeps the (expensive) integrator in float32 while the method math stays
+# float64. For a genuine float64 run every cast below is a no-op.
+_DEFAULT_FLOAT = np.zeros(()).dtype
+
+
+def _as_default_float(x):
+    return x.astype(_DEFAULT_FLOAT) if np.issubdtype(x.dtype, np.floating) else x
+
+
 class Sampler:
     def __init__(self, method_bundle, context_state, callback: Callable):
         initial_snapshot, initialize, method_update = method_bundle
@@ -36,11 +51,12 @@ class Sampler:
 
 def take_snapshot(state, box, dt):
     dims = box.shape[0]
-    positions = state.position
-    forces = getattr(state, "force", state.position)
+    # Promote integrator arrays to PySAGES' canonical float (see `_as_default_float`)
+    positions = _as_default_float(state.position)
+    forces = _as_default_float(getattr(state, "force", state.position))
     ids = np.arange(len(positions))
-    velocities = getattr(state, "velocity", state.position)
-    masses = state.mass.reshape(-1, 1)
+    velocities = _as_default_float(getattr(state, "velocity", state.position))
+    masses = _as_default_float(state.mass.reshape(-1, 1))
     vel_mass = (velocities, masses)
     origin = tuple(0.0 for _ in range(dims))
 
@@ -70,10 +86,11 @@ def take_snapshot(state, box, dt):
 
 
 def update_snapshot(snapshot, state, box=None):
-    _, masses = snapshot.vel_mass
-    positions = state.position
-    vel_mass = (state.velocity, masses)
-    forces = state.force
+    _, masses = snapshot.vel_mass  # already promoted in `take_snapshot`
+    # Promote integrator arrays to PySAGES' canonical float (see `_as_default_float`)
+    positions = _as_default_float(state.position)
+    vel_mass = (_as_default_float(state.velocity), masses)
+    forces = _as_default_float(state.force)
 
     # Support NVT (.chain), NPT (.thermostat), and NVE (no chain)
     chain = getattr(state, 'chain', None) or getattr(state, 'thermostat', None)
@@ -165,8 +182,12 @@ def build_runner(context, sampler, jit_compile=True):
                 # 0.5*dt per MD step instead of dt. Adding 0.5*dt*bias here
                 # plus the leading-half kick on the next step (via state.force
                 # below) restores a full dt kick per step.
-                new_momentum = context_state.momentum + 0.5 * dt * sampler_state.bias
-                biased_forces = context_state.force + sampler_state.bias
+                # The bias is float64 (PySAGES methods compute in x64); cast it
+                # down to the integrator dtype so a float32 run keeps its momentum
+                # and force in float32 (no-op for a float64 run).
+                bias = sampler_state.bias.astype(context_state.momentum.dtype)
+                new_momentum = context_state.momentum + 0.5 * dt * bias
+                biased_forces = context_state.force + bias
                 context_state = dataclasses.replace(
                     context_state, momentum=new_momentum, force=biased_forces,
                 )
