@@ -21,11 +21,14 @@ import jax.lax
 # PySAGES forces `jax_enable_x64` on (pysages/__init__.py), so the default float is
 # float64 -- the dtype every sampling method initializes its state with via bare
 # `np.zeros(...)`. When the jax-md integrator runs in float32 (e.g. so3lr_dev's
-# `precision: "float32"`), its snapshot arrays must be promoted to this canonical
-# float before reaching the methods, otherwise fields a method recomputes from the
-# snapshot (e.g. ABF's `Wp`) come back float32 and flip the `fori_loop` carry dtype.
-# This keeps the (expensive) integrator in float32 while the method math stays
-# float64. For a genuine float64 run every cast below is a no-op.
+# `precision: "float32"`), data a method recomputes from the snapshot (e.g. ABF's
+# `Wp`) comes back float32 and flips the `fori_loop` carry dtype. We promote to this
+# canonical float at the snapshot *query* layer (`build_snapshot_methods`), i.e. only
+# in the view handed to methods, so method math stays float64 while the stored
+# `Snapshot` remains a faithful float32 mirror of the integrator. That matters because
+# the host engine reconstructs its (float32) state from the returned snapshot; promoting
+# the snapshot itself would leak float64 back across that boundary. For a genuine
+# float64 run every cast is a no-op.
 _DEFAULT_FLOAT = np.zeros(()).dtype
 
 
@@ -51,12 +54,11 @@ class Sampler:
 
 def take_snapshot(state, box, dt):
     dims = box.shape[0]
-    # Promote integrator arrays to PySAGES' canonical float (see `_as_default_float`)
-    positions = _as_default_float(state.position)
-    forces = _as_default_float(getattr(state, "force", state.position))
+    positions = state.position
+    forces = getattr(state, "force", state.position)
     ids = np.arange(len(positions))
-    velocities = _as_default_float(getattr(state, "velocity", state.position))
-    masses = _as_default_float(state.mass.reshape(-1, 1))
+    velocities = getattr(state, "velocity", state.position)
+    masses = state.mass.reshape(-1, 1)
     vel_mass = (velocities, masses)
     origin = tuple(0.0 for _ in range(dims))
 
@@ -86,11 +88,10 @@ def take_snapshot(state, box, dt):
 
 
 def update_snapshot(snapshot, state, box=None):
-    _, masses = snapshot.vel_mass  # already promoted in `take_snapshot`
-    # Promote integrator arrays to PySAGES' canonical float (see `_as_default_float`)
-    positions = _as_default_float(state.position)
-    vel_mass = (_as_default_float(state.velocity), masses)
-    forces = _as_default_float(state.force)
+    _, masses = snapshot.vel_mass
+    positions = state.position
+    vel_mass = (state.velocity, masses)
+    forces = state.force
 
     # Support NVT (.chain), NPT (.thermostat), and NVE (no chain)
     chain = getattr(state, 'chain', None) or getattr(state, 'thermostat', None)
@@ -134,14 +135,15 @@ def build_snapshot_methods(context, sampling_method):
 
     def masses(snapshot):
         _, M = snapshot.vel_mass
-        return M
+        return _as_default_float(M)
 
     def positions(snapshot):
-        return snapshot.positions
+        # Promote to the canonical float for the method view (see `_as_default_float`)
+        return _as_default_float(snapshot.positions)
 
     def momenta(snapshot):
         V, M = snapshot.vel_mass
-        return (V * M).flatten()
+        return _as_default_float((V * M).flatten())
 
     return SnapshotMethods(positions, indices, jit(momenta), masses)
 
