@@ -17,6 +17,7 @@ from pysages.backends.snapshot import (
 from pysages.typing import Callable, NamedTuple
 from pysages.utils import check_device_array, copy
 import jax.lax
+import jax.tree_util
 
 # PySAGES forces `jax_enable_x64` on (pysages/__init__.py), so the default float is
 # float64 -- the dtype every sampling method initializes its state with via bare
@@ -34,6 +35,30 @@ _DEFAULT_FLOAT = np.zeros(()).dtype
 
 def _as_default_float(x):
     return x.astype(_DEFAULT_FLOAT) if np.issubdtype(x.dtype, np.floating) else x
+
+
+def _match_float_dtypes(reference, target):
+    """Cast every floating-point leaf of ``target`` back to the dtype of the
+    corresponding leaf in ``reference``.
+
+    PySAGES forces ``jax_enable_x64`` on (pysages/__init__.py). With x64 enabled,
+    any explicit float64 constant the host integrator mixes into its MD step
+    (e.g. a ``jnp.array(...)`` that defaults to float64, masses, dt) silently
+    promotes the float32 integrator arrays to float64 -- even though the same
+    integrator stays in float32 when run standalone (x64 off). That promotion
+    breaks jax-md's ``fori_loop``, whose carry must be dtype-stable across the
+    body. We therefore restore the reference (= integrator) float dtype on every
+    carried array at the end of each step, so a float32 run carries float32
+    end-to-end no matter which sampling method or integrator constants are in
+    play. This is method-independent and a no-op for a genuine float64 run.
+    """
+    def cast_like(ref, val):
+        if (hasattr(val, "dtype") and hasattr(ref, "dtype")
+                and np.issubdtype(val.dtype, np.floating)):
+            return val.astype(ref.dtype)
+        return val
+
+    return jax.tree_util.tree_map(cast_like, reference, target)
 
 
 class Sampler:
@@ -168,6 +193,13 @@ def build_runner(context, sampler, jit_compile=True):
         jax_fn_container['is_defined'] = True
 
         def _step(sampling_context_state, snapshot, sampler_state):
+            # Remember the integrator's float dtype (float32 for a float32 run)
+            # before stepping, so we can restore it across the whole carry at the
+            # end -- the host MD step can silently promote it to float64 under
+            # PySAGES' forced x64 mode (see `_match_float_dtypes`).
+            ref_context_state = sampling_context_state
+            ref_snapshot = snapshot
+
             sampling_context_state = step_fn(sampling_context_state)  # jax_md simulation step
             context_state = sampling_context_state.state
             # Extract box from extras (needed for NPT where box evolves each step)
@@ -194,6 +226,12 @@ def build_runner(context, sampler, jit_compile=True):
                     context_state, momentum=new_momentum, force=biased_forces,
                 )
                 sampling_context_state = sampling_context_state._replace(state=context_state)
+
+            # Restore the integrator float dtype across the entire carry so the
+            # `fori_loop`/`scan` carry stays dtype-stable regardless of any
+            # float64 promotion inside the host MD step or the method bias.
+            sampling_context_state = _match_float_dtypes(ref_context_state, sampling_context_state)
+            snapshot = _match_float_dtypes(ref_snapshot, snapshot)
             return sampling_context_state, snapshot, sampler_state
 
         step = jit(_step) if jit_compile else _step
