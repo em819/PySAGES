@@ -717,6 +717,14 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions,
     else:
         diff_mic = diff
 
+    # Padding/filtered slots have safe_neighbor_indices == 0; when the center atom
+    # is itself index 0 these become self-pairs with a zero displacement, and
+    # np.linalg.norm has a 0/0 = NaN gradient there. Masking after the norm cannot
+    # remove it (the where() VJP multiplies the dead branch by 0, and 0 * NaN = NaN),
+    # so make invalid displacements non-zero *before* the norm. valid_mask is a
+    # position-independent padding mask, so this is a no-op on both the value
+    # (zeroed by * valid_mask below) and the gradient of every valid slot.
+    diff_mic = np.where(valid_mask[:, :, None], diff_mic, 1.0)
     distances = np.linalg.norm(diff_mic, axis=2)  # Shape: (n, max_neighbors)
 
     def normalize_distances(distances, r0_table, element_ids_center, element_ids_neighbors):
