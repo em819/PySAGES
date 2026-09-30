@@ -487,6 +487,7 @@ class CoordinationNumber(TwoPointCV):
         cn_exponents=None,
         indices_nn=None,
         switching_function='stable',
+        r0_multiplier=None,
     ):
         """
         Coordination Number Collective Variable.
@@ -525,6 +526,8 @@ class CoordinationNumber(TwoPointCV):
               few ulps of 1, which can silently break biased MD (see morpholine
               decomposition incident, 2026-04-21). Kept for reproducing older
               results.
+        r0_multiplier : float, optional — factor applied to the sum of covalent radii, 
+                        r0 = r0_multiplier * (r_i + r_j). Default 1.6.
         """
         super().__init__(indices)
         self.nbrs = nbrs
@@ -547,7 +550,12 @@ class CoordinationNumber(TwoPointCV):
         else:
             self.nn_mask = None
 
-        self.r0_table_species = self.extract_r0_for_species(self.radii_table_default, self.species)
+        #self.r0_table_species = self.extract_r0_for_species(self.radii_table_default, self.species)
+        r0_multiplier = 1.6 if r0_multiplier is None else float(r0_multiplier)
+        if not r0_multiplier > 0.0:
+            raise ValueError(f"r0_multiplier={r0_multiplier!r} must be positive.")
+        self.r0_table_species = self.extract_r0_for_species(self.radii_table_default,self.species, r0_multiplier)
+
         self.r0_lookup_table, self.element_to_index, self.element_ids_array, self.particle_to_lookup_idx = self.create_r0_lookup_table(self.r0_table_species, self.species)
         self.number_nn_max = np.minimum(int(self.determine_max_neighbors(self.nbrs, self.indices_cn) * 4.0), len(self.species))
         self.num_exp, self.denom_exp = cn_exponents if cn_exponents is not None else (6, 12)
@@ -584,12 +592,12 @@ class CoordinationNumber(TwoPointCV):
         return np.max(num_neighbors)
 
 
-    def extract_r0_for_species(self, radii_table_default, species):
+    def extract_r0_for_species(self, radii_table_default, species, multiplier=1.6):
         unique_elements = np.unique(species)
         i, j = np.triu_indices(len(unique_elements), k=0)
         pairs = np.stack([unique_elements[i], unique_elements[j]], axis=1)
 
-        return {(int(p[0]), int(p[1])): (radii_table_default[int(p[0])] + radii_table_default[int(p[1])]) * 1.6 for p in pairs}
+        return {(int(p[0]), int(p[1])): (radii_table_default[int(p[0])] + radii_table_default[int(p[1])]) * multiplier for p in pairs}
 
     def create_r0_lookup_table(self, r0_table_species, species):
         unique_elements = sorted(set(elem for pair in r0_table_species.keys() for elem in pair))
