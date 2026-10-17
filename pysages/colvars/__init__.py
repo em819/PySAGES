@@ -12,6 +12,7 @@ PySAGES with your own.
 
 from .angles import Angle, DihedralAngle
 from .coordinates import (
+    ChargeSeparation,
     Component,
     DifferenceOfDistances,
     DifferenceOfDistancesPBC,

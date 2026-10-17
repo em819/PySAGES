@@ -8,7 +8,7 @@ Collective Variables that are computed from the Cartesian coordinates.
 from jax import numpy as np
 from jax.numpy import linalg
 import jax
-from pysages.colvars.core import AxisCV, TwoPointCV, multicomponent, FourPointCV
+from pysages.colvars.core import AxisCV, CollectiveVariable, TwoPointCV, multicomponent, FourPointCV
 import logging
 
 
@@ -788,3 +788,80 @@ def calculate_coordination_number(edge_list_obj, indices_cn, all_positions,
         cn_value = np.sum(cn_terms)
 
     return cn_value
+
+
+class ChargeSeparation(CollectiveVariable):
+    """
+    Signed charge-separation distance between an acid/base and the excess proton
+    (H3O+) or proton hole (OH-) in the solvent, after Xu, Liu, Malosso, Loche and
+    Ceriotti, arXiv:2610.13265 (Eqs. 7-9).
+
+    Every hydrogen j is shared among the proton-owner sites i (heavy atoms) with
+    Gaussian weights, the formal charge of each water oxygen is the number of
+    hydrogens it owns minus two, and the CV sums charge times distance to the
+    reference point over the water oxygens:
+
+        n_{j->i} = exp(-|r_j - r_i|^2 / 2 sigma^2) / sum_k exp(-|r_j - r_k|^2 / 2 sigma^2)
+        q_w      = sum_j n_{j->w} - n_ref_water
+        s        = sum_w q_w |mic(r_w - r_ref)|
+
+    s ~ 0 for the undissociated solute, s ~ +d after an acidic dissociation (H3O+
+    at distance d) and s ~ -d after a basic one (OH- at distance d); during proton
+    transfer and Grotthuss hops s changes continuously.
+
+    Differences to the paper: the hydrogens are shared among all heavy atoms passed
+    as owner sites (not only O), so that C-H and N-H hydrogens of a peptide stay on
+    their own atom instead of being assigned to a nearby water; all pairs are
+    evaluated (no neighbor-list cutoff; the weights beyond the paper's 3.5 A cutoff
+    are < 1e-30); r_ref is the centroid of one or more reference atoms. Distances use
+    the minimum-image convention of the orthorhombic box given at construction, so
+    the CV is only valid at constant volume.
+
+    Parameters
+    ----------
+    indices : list of three groups
+        [hydrogen atoms, owner sites (heavy atoms), reference atoms].
+    box : array-like
+        Orthorhombic box lengths (3,).
+    water_sites : array-like of int
+        Positions of the water oxygens within the owner-site group.
+    sigma : float, optional
+        Width of the Gaussian assignment (Angstrom). Default 0.3 (paper value).
+    n_ref_water : float, optional
+        Hydrogens owned by a neutral water oxygen. Default 2.
+    """
+
+    def __init__(self, indices, box, water_sites, sigma=0.3, n_ref_water=2.0):
+        super().__init__(indices, 3)
+        self.box = np.asarray(box, dtype=float)
+        self.water_sites = np.asarray(water_sites, dtype=np.int32)
+        self.sigma = float(sigma)
+        self.n_ref_water = float(n_ref_water)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        return lambda r_h, r_sites, r_ref: charge_separation(
+            r_h, r_sites, r_ref, self.box, self.water_sites, self.sigma,
+            self.n_ref_water)[0]
+
+
+def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water):
+    """
+    Value of :class:`ChargeSeparation` and the number of hydrogens owned by every
+    owner site (returned for monitoring, e.g. protonation of other solute sites or
+    additional H3O+/OH- pairs in the solvent).
+    """
+    def mic(d):
+        return d - box * np.round(d / box)
+
+    # Gaussian sharing of every hydrogen among all owner sites (rows sum to one)
+    d2 = np.sum(mic(r_h[:, None, :] - r_sites[None, :, :]) ** 2, axis=-1)
+    n_owned = np.sum(jax.nn.softmax(-d2 / (2.0 * sigma**2), axis=1), axis=0)
+    q_water = n_owned[water_sites] - n_ref_water
+
+    # reference point: centroid of the reference atoms, made whole around the first one
+    r0 = r_ref[0] + np.mean(mic(r_ref - r_ref[0]), axis=0)
+    d_w = np.sqrt(np.sum(mic(r_sites[water_sites] - r0) ** 2, axis=-1) + 1e-12)
+
+    return np.sum(q_water * d_w), n_owned
