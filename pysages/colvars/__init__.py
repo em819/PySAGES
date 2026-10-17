@@ -19,6 +19,7 @@ from .coordinates import (
     Displacement,
     Distance,
     DistancePBC,
+    IonSiteDistance,
     MeanOfDistances,
     MeanOfDistancesPBC,
     RelativeComponent,

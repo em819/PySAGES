@@ -865,3 +865,148 @@ def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water)
     d_w = np.sqrt(np.sum(mic(r_sites[water_sites] - r0) ** 2, axis=-1) + 1e-12)
 
     return np.sum(q_water * d_w), n_owned
+
+
+class IonSiteDistance(CollectiveVariable):
+    """
+    Distance between an ionizable site and the water molecule that carries the excess
+    proton (H3O+, ``mode='acid'``) or the proton hole (OH-, ``mode='base'``). Meant to
+    be biased together with a :class:`CoordinationNumber` of the same site: the
+    coordination number drives the proton transfer, this CV the separation of the
+    ion pair. Adapted from the "Hydrodist" CV of Park et al. (JACS 2006, 128, 11318)
+    and Guo, Albesa and Wexler (JPCB 2023, 127, 8446).
+
+        n_i = sum_{j in H} s(|r_Oi - r_Hj|)            (H count of water oxygen i)
+        x_i = n_i - n0   (acid)   or   n0 - n_i   (base)
+        u_i = ramp(x_i)^p,   u_0 = ramp(0)^p           (u_0: placeholder candidate)
+        xi  = [sum_i u_i d_i + u_0 d_null] / [sum_i u_i + u_0]
+
+    with d_i the distance of water oxygen i to the site (averaged over the site atoms,
+    e.g. both carboxylate O). ramp(x) is a C2-smooth version of max(x, 0) that is
+    exactly 0 for x <= -a and exactly x for x >= a.
+
+    Differences to Hydrodist, which weights all waters with exp(lambda n_i) and
+    multiplies the result by a switching function of the site's own H count:
+
+    - Ordinary waters (n_i <= n0 - a in acid mode) have exactly zero weight and
+      gradient, so the CV does not depend on the number of waters in the box.
+    - Instead of the switching function, a placeholder candidate with H count exactly
+      n0 sits at distance d_null. When no water carries an excess (acid) or deficit
+      (base) proton, e.g. while the proton is still on the site, xi = d_null and its
+      gradient is exactly zero: the bias acts through the coordination number only and
+      exerts no force on the solvent. ABF needs ``use_pinv=True`` to handle this. Once
+      an H3O+/OH- exists (|x| ~ 0.5) it outweighs the placeholder ~10^5 : 1 and xi is
+      its distance to the site. d_null should be close to the contact distance so xi
+      stays continuous when the ion forms. A proton shared between the site and a
+      water can already give that water a partial weight (xi ~ d_null either way).
+    - The site's own H count does not enter (no switching function), which keeps the
+      CV distinguishable from the coordination number during the transfer.
+    - A base mode tracks OH-. It is less robust than the acid mode: a strongly
+      hydrogen-bonded OH- can have an H count close to n0, so the selection margin is
+      small. Prefer simulating basic residues in their protonated form (acid mode).
+
+    s is the rational switching function 1 / sum_{k<K} x^(k n), x = r / r0_water,
+    K = m / n (the 'stable' form of :class:`CoordinationNumber`). Distances use the
+    minimum-image convention of the orthorhombic box given at construction, so the CV
+    is only valid at constant volume. All water oxygen - hydrogen pairs are evaluated
+    (no neighbor list).
+
+    Parameters
+    ----------
+    indices : list of three groups
+        [site atoms, water oxygen atoms, hydrogen atoms].
+    box : array-like
+        Orthorhombic box: scalar, shape-(3,) edge lengths or shape-(3, 3) diagonal.
+    mode : {'acid', 'base'}
+        'acid' tracks the water with the most H (H3O+), 'base' the fewest (OH-).
+    n0 : float, optional
+        Selection threshold for the water H count. Default 2.35 (acid) / 1.75 (base).
+    a : float, optional
+        Half-width of the smooth ramp (H count units). Default 0.1.
+    p : float, optional
+        Power of the selection weights (>= 1). Default 4.
+    r0_water : float, optional
+        r0 of the water O-H switching function (Angstrom). Default 1.3.
+    water_cn_exps : tuple of (int, int), optional
+        Exponents (n, m) of the water O-H switching function; n even, m % n == 0.
+        Default (16, 32).
+    d_null : float, optional
+        CV value when no H3O+/OH- exists (Angstrom). Default 2.5.
+    """
+
+    def __init__(self, indices, box, mode="acid", n0=None, a=0.1, p=4.0, r0_water=1.3,
+                 water_cn_exps=(16, 32), d_null=2.5):
+        super().__init__(indices, 3)
+        if mode not in ("acid", "base"):
+            raise ValueError(f"mode={mode!r} must be 'acid' or 'base'.")
+        n, m = (int(e) for e in water_cn_exps)
+        if n <= 0 or n % 2 or m % n:
+            raise ValueError(f"water_cn_exps=(n={n}, m={m}) need n even and positive "
+                             "and m a multiple of n.")
+        if not a > 0.0:
+            raise ValueError(f"a={a!r} must be positive.")
+        if not p >= 1.0:
+            raise ValueError(f"p={p!r} must be >= 1 (smooth weights).")
+        if not (r0_water > 0.0 and d_null > 0.0):
+            raise ValueError("r0_water and d_null must be positive.")
+        self.box = _box_edges(np.asarray(box, dtype=float))
+        self.mode = mode
+        self.sign = 1.0 if mode == "acid" else -1.0
+        self.n0 = float((2.35 if mode == "acid" else 1.75) if n0 is None else n0)
+        self.a = float(a)
+        self.p = float(p)
+        self.r0_water = float(r0_water)
+        self.water_cn_exps = (n, m)
+        self.d_null = float(d_null)
+        self.requires_box_unwrapping = False
+
+    @property
+    def function(self):
+        return lambda r_site, r_ow, r_h: ion_site_distance(
+            r_site, r_ow, r_h, self.box, self.sign, self.n0, self.a, self.p,
+            self.r0_water, self.water_cn_exps, self.d_null)[0]
+
+
+def _rational_switch_sq(d2, r0, n, m):
+    """Stable rational switching function 1 / sum_{k<m/n} x^(k n) of squared
+    distances (n even)."""
+    x_n = (d2 / r0**2) ** (n // 2)
+    den = np.ones_like(x_n)
+    x_k = np.ones_like(x_n)
+    for _ in range(m // n - 1):
+        x_k = x_k * x_n
+        den = den + x_k
+    return 1.0 / den
+
+
+def _smooth_ramp(x, a):
+    """C2 ramp: 0 for x <= -a, x for x >= a and L (v^3 - v^4 / 2) in between
+    (v = (x + a) / L, L = 2a)."""
+    L = 2.0 * a
+    v = np.clip((x + a) / L, 0.0, 1.0)
+    return np.where(x >= a, x, L * v**3 * (1.0 - 0.5 * v))
+
+
+def ion_site_distance(r_site, r_ow, r_h, box, sign, n0, a, p, r0_water, water_cn_exps,
+                      d_null):
+    """
+    Value of :class:`IonSiteDistance` and its intermediates for monitoring: the H count
+    of every water oxygen, the normalized weights of the waters and the normalized
+    weight of the placeholder.
+    """
+    def mic(d):
+        return d - box * np.round(d / box)
+
+    # H count of every water oxygen
+    d2_oh = np.sum(mic(r_h[None, :, :] - r_ow[:, None, :]) ** 2, axis=-1)
+    n_w = np.sum(_rational_switch_sq(d2_oh, r0_water, *water_cn_exps), axis=1)
+
+    # selection weights; ordinary waters get exactly zero
+    u = _smooth_ramp(sign * (n_w - n0), a) ** p
+    u0 = _smooth_ramp(np.zeros(()), a) ** p
+    norm = np.sum(u) + u0
+
+    d2_site = np.sum(mic(r_ow[:, None, :] - r_site[None, :, :]) ** 2, axis=-1)
+    d_w = np.mean(np.sqrt(d2_site + 1e-12), axis=1)
+    xi = (np.sum(u * d_w) + u0 * d_null) / norm
+    return xi, n_w, u / norm, u0 / norm
