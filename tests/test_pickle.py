@@ -129,7 +129,7 @@ def test_pickle_methods():
 COLVAR_ARGS = {
     "Angle": {"indices": [0, 1, 2]},
     "ChargeSeparation": {"indices": [[0, 1], [2, 3], [4]], "box": [10.0] * 3, "water_sites": [1]},
-    "IonSiteDistance": {"indices": [[0], [1, 2], [3, 4]], "box": [10.0] * 3},
+    "IonSiteDistance": {"indices": [[0], [0, 1, 2], [3, 4]], "box": [10.0] * 3, "water_sites": [1, 2]},
     "DihedralAngle": {"indices": [0, 1, 2, 3]},
     "RadiusOfGyration": {"indices": [0, 1, 2, 3]},
     "PrincipalMoment": {"indices": [0, 1, 2, 3], "axis": 0},

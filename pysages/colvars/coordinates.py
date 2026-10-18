@@ -876,107 +876,123 @@ class IonSiteDistance(CollectiveVariable):
     ion pair. Adapted from the "Hydrodist" CV of Park et al. (JACS 2006, 128, 11318)
     and Guo, Albesa and Wexler (JPCB 2023, 127, 8446).
 
-        n_i = sum_{j in H} s(|r_Oi - r_Hj|)            (H count of water oxygen i)
-        x_i = n_i - n0   (acid)   or   n0 - n_i   (base)
-        u_i = ramp(x_i)^p,   u_0 = ramp(0)^p           (u_0: placeholder candidate)
-        xi  = [sum_i u_i d_i + u_0 d_null] / [sum_i u_i + u_0]
+        n_i   = sum_{j in H} w_{j->i}                  (H owned by water oxygen i)
+        w_{j->k} = exp(-|r_j - r_k|^2 / 2 sigma^2) / sum_l exp(-|r_j - r_l|^2 / 2 sigma^2)
+        e_i   = S((x_i + a) / 2a),   x_i = n_i - n0 (acid) or n0 - n_i (base)
+        E     = sum_i e_i                              (number of ions, 0 ... 1)
+        d_ref = -tau ln sum_i exp(-d_i / tau)          (soft distance to the nearest water)
+        w_0   = ramp(1 - E - b)                        (weight of the nearest-water term)
+        xi    = [sum_i e_i d_i + w_0 d_ref] / [E + w_0]
 
     with d_i the distance of water oxygen i to the site (averaged over the site atoms,
-    e.g. both carboxylate O). ramp(x) is a C2-smooth version of max(x, 0) that is
-    exactly 0 for x <= -a and exactly x for x >= a.
+    e.g. both carboxylate O). Every hydrogen j is shared among all owner atoms k (all
+    heavy atoms, including the site and the water oxygens) with Gaussian weights, as in
+    :class:`ChargeSeparation`. e_i is the ion share of water i: S(t) = t^3 (10 - 15 t +
+    6 t^2) is the C2 smoothstep on [0, 1] (0 below, 1 above), so e_i = 0 for
+    x_i <= -a and e_i = 1 for x_i >= a. ramp(y) is a C2-smooth version of max(y, 0)
+    that is exactly 0 for y <= -b and exactly y for y >= b, with b = 0.05.
 
-    Differences to Hydrodist, which weights all waters with exp(lambda n_i) and
-    multiplies the result by a switching function of the site's own H count:
+    Behaviour:
 
-    - Ordinary waters (n_i <= n0 - a in acid mode) have exactly zero weight and
-      gradient, so the CV does not depend on the number of waters in the box.
-    - Instead of the switching function, a placeholder candidate with H count exactly
-      n0 sits at distance d_null. When no water carries an excess (acid) or deficit
-      (base) proton, e.g. while the proton is still on the site, xi = d_null and its
-      gradient is exactly zero: the bias acts through the coordination number only and
-      exerts no force on the solvent. ABF needs ``use_pinv=True`` to handle this. Once
-      an H3O+/OH- exists (|x| ~ 0.5) it outweighs the placeholder ~10^5 : 1 and xi is
-      its distance to the site. d_null should be close to the contact distance so xi
-      stays continuous when the ion forms. A proton shared between the site and a
-      water can already give that water a partial weight (xi ~ d_null either way).
-    - The site's own H count does not enter (no switching function), which keeps the
-      CV distinguishable from the coordination number during the transfer.
-    - A base mode tracks OH-. It is less robust than the acid mode: a strongly
-      hydrogen-bonded OH- can have an H count close to n0, so the selection margin is
-      small. Prefer simulating basic residues in their protonated form (acid mode).
+    - Neutral water owns 2.00 H, H3O+ 3.00 and OH- 1.00 (sigma = 0.25 A: a strong
+      hydrogen bond adds < 0.05). With n0 = 2.5, a = 0.4 (acid) every neutral water
+      has exactly zero ion share and gradient, and an H3O+ has share 1.
+    - While no H3O+/OH- exists (e.g. the proton is still on the site), E = 0 and
+      xi = d_ref, the distance to the nearest water, i.e. the water that would receive
+      the proton. The CV therefore has an O(1) gradient everywhere and stays continuous
+      when the ion forms on that water. It is never flat on purpose: ABF estimates the
+      generalized force from W p with W = pinv(J^T), which grows as 1 / |grad xi|, so a
+      CV that is constant in part of the space passes through arbitrarily small
+      gradients at the edge of that part and produces unbounded force estimates
+      (``use_pinv`` only handles an exactly zero gradient).
+    - Once a full ion exists (E = 1) the nearest-water term has exactly zero weight and
+      xi is the ion's distance. When the proton hops between two waters they share
+      n_A + n_B = 5 H (acid), so e_A + e_B = 1 because S(t) + S(1 - t) = 1: xi =
+      e_A d_A + e_B d_B moves smoothly from one distance to the other (over ~0.04 A of
+      proton motion for a 2.45 A hop at sigma = 0.25 A, i.e. several MD steps), without
+      the nearest-water term cutting in. A larger sigma makes hops smoother, but a
+      neutral water must stay below n0 - a.
+    - In the no-ion state the bias acts on the waters around the site; ABF slowly
+      explores configurations in which the nearest water is pushed away from the site.
+      This only costs sampling time.
+    - The site's own H count does not enter, which keeps the CV distinguishable from
+      the coordination number during the transfer.
+    - A base mode tracks OH- (n0 = 1.5). Prefer simulating basic residues in their
+      protonated form (acid mode).
 
-    s is the rational switching function 1 / sum_{k<K} x^(k n), x = r / r0_water,
-    K = m / n (the 'stable' form of :class:`CoordinationNumber`). Distances use the
-    minimum-image convention of the orthorhombic box given at construction, so the CV
-    is only valid at constant volume. All water oxygen - hydrogen pairs are evaluated
-    (no neighbor list).
+    The owner group must contain every heavy atom that can carry a hydrogen (in
+    practice all heavy atoms); otherwise e.g. the H of a C-H group is assigned to the
+    nearest water oxygen. Distances use the minimum-image convention of the
+    orthorhombic box given at construction, so the CV is only valid at constant
+    volume. All hydrogen - owner pairs are evaluated (no neighbor list).
 
     Parameters
     ----------
     indices : list of three groups
-        [site atoms, water oxygen atoms, hydrogen atoms].
+        [site atoms, owner atoms (all heavy atoms, incl. site and water O), hydrogen
+        atoms]. The site atoms must also be owners.
     box : array-like
         Orthorhombic box: scalar, shape-(3,) edge lengths or shape-(3, 3) diagonal.
+    water_sites : array-like of int
+        Positions of the water oxygens within the owner group.
     mode : {'acid', 'base'}
         'acid' tracks the water with the most H (H3O+), 'base' the fewest (OH-).
     n0 : float, optional
-        Selection threshold for the water H count. Default 2.35 (acid) / 1.75 (base).
+        Water H count at which the ion share is 1/2. Default 2.5 (acid) / 1.5 (base).
     a : float, optional
-        Half-width of the smooth ramp (H count units). Default 0.1.
-    p : float, optional
-        Power of the selection weights (>= 1). Default 4.
-    r0_water : float, optional
-        r0 of the water O-H switching function (Angstrom). Default 1.3.
-    water_cn_exps : tuple of (int, int), optional
-        Exponents (n, m) of the water O-H switching function; n even, m % n == 0.
-        Default (16, 32).
-    d_null : float, optional
-        CV value when no H3O+/OH- exists (Angstrom). Default 2.5.
+        Half-width of the ion-share step (H count units): share 0 below n0 - a, 1
+        above n0 + a. Default 0.4. Neutral water (2 H) must have share 0 and the ion
+        (3 H in acid, 1 H in base mode) share 1.
+    sigma : float, optional
+        Width of the Gaussian H assignment (Angstrom). Default 0.25.
+    tau : float, optional
+        Softness of the nearest-water distance d_ref (Angstrom). Default 0.2.
     """
 
-    def __init__(self, indices, box, mode="acid", n0=None, a=0.1, p=4.0, r0_water=1.3,
-                 water_cn_exps=(16, 32), d_null=2.5):
+    def __init__(self, indices, box, water_sites, mode="acid", n0=None, a=0.4,
+                 sigma=0.25, tau=0.2):
         super().__init__(indices, 3)
         if mode not in ("acid", "base"):
             raise ValueError(f"mode={mode!r} must be 'acid' or 'base'.")
-        n, m = (int(e) for e in water_cn_exps)
-        if n <= 0 or n % 2 or m % n:
-            raise ValueError(f"water_cn_exps=(n={n}, m={m}) need n even and positive "
-                             "and m a multiple of n.")
+        sign = 1.0 if mode == "acid" else -1.0
+        n0 = float((2.5 if mode == "acid" else 1.5) if n0 is None else n0)
         if not a > 0.0:
             raise ValueError(f"a={a!r} must be positive.")
-        if not p >= 1.0:
-            raise ValueError(f"p={p!r} must be >= 1 (smooth weights).")
-        if not (r0_water > 0.0 and d_null > 0.0):
-            raise ValueError("r0_water and d_null must be positive.")
+        if not (sigma > 0.0 and tau > 0.0):
+            raise ValueError("sigma and tau must be positive.")
+        if not sign * (2.0 - n0) <= -a:
+            raise ValueError(f"n0={n0}, a={a}: neutral water (2 H) must have zero ion share "
+                             f"({'n0 - a >= 2' if mode == 'acid' else 'n0 + a <= 2'}).")
+        if not sign * ((3.0 if mode == "acid" else 1.0) - n0) >= a:
+            ion = "H3O+ (3 H)" if mode == "acid" else "OH- (1 H)"
+            raise ValueError(f"n0={n0}, a={a}: the {ion} must have ion share 1 "
+                             f"({'n0 + a <= 3' if mode == 'acid' else 'n0 - a >= 1'}).")
+        atoms = [self.indices[g].tolist() for g in self.groups]
+        water_sites = [int(i) for i in water_sites]
+        if len(water_sites) == 0 or len(set(water_sites)) != len(water_sites):
+            raise ValueError("water_sites must be non-empty and unique.")
+        if min(water_sites) < 0 or max(water_sites) >= len(atoms[1]):
+            raise ValueError("water_sites must index the owner group.")
+        if not set(atoms[0]) <= set(atoms[1]):
+            raise ValueError("The site atoms must also be owner atoms (so that the site "
+                             "keeps its own hydrogens).")
+        if set(atoms[1][i] for i in water_sites) & set(atoms[0]):
+            raise ValueError("The site atoms must not be water oxygens.")
         self.box = _box_edges(np.asarray(box, dtype=float))
+        self.water_sites = np.asarray(water_sites, dtype=np.int32)
         self.mode = mode
-        self.sign = 1.0 if mode == "acid" else -1.0
-        self.n0 = float((2.35 if mode == "acid" else 1.75) if n0 is None else n0)
+        self.sign = sign
+        self.n0 = n0
         self.a = float(a)
-        self.p = float(p)
-        self.r0_water = float(r0_water)
-        self.water_cn_exps = (n, m)
-        self.d_null = float(d_null)
+        self.sigma = float(sigma)
+        self.tau = float(tau)
         self.requires_box_unwrapping = False
 
     @property
     def function(self):
-        return lambda r_site, r_ow, r_h: ion_site_distance(
-            r_site, r_ow, r_h, self.box, self.sign, self.n0, self.a, self.p,
-            self.r0_water, self.water_cn_exps, self.d_null)[0]
-
-
-def _rational_switch_sq(d2, r0, n, m):
-    """Stable rational switching function 1 / sum_{k<m/n} x^(k n) of squared
-    distances (n even)."""
-    x_n = (d2 / r0**2) ** (n // 2)
-    den = np.ones_like(x_n)
-    x_k = np.ones_like(x_n)
-    for _ in range(m // n - 1):
-        x_k = x_k * x_n
-        den = den + x_k
-    return 1.0 / den
+        return lambda r_site, r_own, r_h: ion_site_distance(
+            r_site, r_own, r_h, self.box, self.water_sites, self.sign, self.n0, self.a,
+            self.sigma, self.tau)[0]
 
 
 def _smooth_ramp(x, a):
@@ -987,26 +1003,38 @@ def _smooth_ramp(x, a):
     return np.where(x >= a, x, L * v**3 * (1.0 - 0.5 * v))
 
 
-def ion_site_distance(r_site, r_ow, r_h, box, sign, n0, a, p, r0_water, water_cn_exps,
-                      d_null):
+def _smoothstep(t):
+    """C2 smoothstep: 0 for t <= 0, 1 for t >= 1 and t^3 (10 - 15 t + 6 t^2) in between;
+    S(t) + S(1 - t) = 1."""
+    t = np.clip(t, 0.0, 1.0)
+    return t**3 * (10.0 - 15.0 * t + 6.0 * t**2)
+
+
+# Half-width of the ramp that switches the nearest-water term off as the ion forms
+_ION_SITE_DISTANCE_B = 0.05
+
+
+def ion_site_distance(r_site, r_own, r_h, box, water_sites, sign, n0, a, sigma, tau):
     """
     Value of :class:`IonSiteDistance` and its intermediates for monitoring: the H count
-    of every water oxygen, the normalized weights of the waters and the normalized
-    weight of the placeholder.
+    of every water oxygen, the normalized weights of the waters, the normalized weight
+    of the nearest-water term and the nearest-water distance d_ref.
     """
     def mic(d):
         return d - box * np.round(d / box)
 
-    # H count of every water oxygen
-    d2_oh = np.sum(mic(r_h[None, :, :] - r_ow[:, None, :]) ** 2, axis=-1)
-    n_w = np.sum(_rational_switch_sq(d2_oh, r0_water, *water_cn_exps), axis=1)
+    # H owned by every water oxygen (Gaussian sharing among all owners, rows sum to one)
+    d2_h = np.sum(mic(r_h[:, None, :] - r_own[None, :, :]) ** 2, axis=-1)
+    n_w = np.sum(jax.nn.softmax(-d2_h / (2.0 * sigma**2), axis=1), axis=0)[water_sites]
 
-    # selection weights; ordinary waters get exactly zero
-    u = _smooth_ramp(sign * (n_w - n0), a) ** p
-    u0 = _smooth_ramp(np.zeros(()), a) ** p
-    norm = np.sum(u) + u0
+    # ion shares; neutral waters get exactly zero, a full ion exactly one
+    e = _smoothstep((sign * (n_w - n0) + a) / (2.0 * a))
+    b = _ION_SITE_DISTANCE_B
+    w0 = _smooth_ramp(1.0 - np.sum(e) - b, b)
+    norm = np.sum(e) + w0
 
-    d2_site = np.sum(mic(r_ow[:, None, :] - r_site[None, :, :]) ** 2, axis=-1)
+    d2_site = np.sum(mic(r_own[water_sites][:, None, :] - r_site[None, :, :]) ** 2, axis=-1)
     d_w = np.mean(np.sqrt(d2_site + 1e-12), axis=1)
-    xi = (np.sum(u * d_w) + u0 * d_null) / norm
-    return xi, n_w, u / norm, u0 / norm
+    d_ref = -tau * jax.nn.logsumexp(-d_w / tau)
+    xi = (np.sum(e * d_w) + w0 * d_ref) / norm
+    return xi, n_w, e / norm, w0 / norm, d_ref
