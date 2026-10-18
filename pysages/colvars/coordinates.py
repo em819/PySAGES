@@ -829,28 +829,109 @@ class ChargeSeparation(CollectiveVariable):
         Width of the Gaussian assignment (Angstrom). Default 0.3 (paper value).
     n_ref_water : float, optional
         Hydrogens owned by a neutral water oxygen. Default 2.
+    pair_guard : bool, optional
+        Guard against water autoionisation (default False: the CV of the paper).
+        A single acidic or basic dissociation creates one charged water (H3O+ or
+        OH-); a solvent that holds a hydronium and a hydroxide at the same time has
+        autoionised. With the guard such configurations are mapped onto s = 0, the
+        value of the undissociated solute:
+
+            P = sum_w S((n_w - n_hydronium) / guard_width)     (hydronium character)
+            M = sum_w S((n_hydroxide - n_w) / guard_width)     (hydroxide character)
+            s_guard = [1 - S(P M / guard_x0)] s
+
+        with S the C2 smoothstep of :class:`IonSiteDistance` (0 below 0, 1 above 1).
+        Waters with n_hydroxide <= n_w <= n_hydronium contribute exactly zero to P and
+        M, so P M and its gradient are exactly zero for neutral water, one H3O+ (also
+        when its proton is shared with a neighbour), one OH- and the undissociated
+        solute: there s_guard = s with the same gradient. A full pair moves s_guard
+        to the undissociated value, so a bias that flattens the free energy along s
+        opposes its formation by the free energy of the dissociated state relative to
+        the undissociated one. Partial pairs are not suppressed: with the defaults a
+        water-water proton transfer still shifts s by up to ~1 A before the guard
+        switches on. Configurations with a pair enter the statistics at s ~ 0.
+
+        Not recommended with ABF. The factor multiplies s, so while a pair forms the
+        gradient grows with s and the CV becomes very stiff: in an Asp solution with
+        the H3O+ 7.7 A from the site and a water at 1.60 H, |grad s| rose from 15 to
+        430 and the curvature along the gradient from -150 to 7400 1/A. ABF applies
+        the bin mean force times this gradient, which can exceed what a 0.5 fs step
+        integrates stably. For P M >= guard_x0 the CV is exactly flat (zero
+        gradient), and the ABF force estimate diverges as 1 / |grad s| at the edge
+        of that region, which lies at s ~ 0.
+    n_hydronium, n_hydroxide : float, optional
+        H counts above / below which a water starts to count as hydronium /
+        hydroxide. Default n_ref_water + 0.1 / n_ref_water - 0.1. At sigma = 0.3 A in a
+        1410-water solution of an Asp peptide, waters stayed above 1.91 H in
+        undissociated frames, but one dropped to 1.60 H in 1 of 1602 frames with an
+        H3O+ (spontaneous partial autoionisation), which switches the guard on.
+        Waters above 2.1 H shared the excess proton of the H3O+.
+    guard_width : float, optional
+        Width (H count units) over which the hydronium / hydroxide share goes from 0
+        to 1. Default 0.8, so a full H3O+ (3 H) or OH- (1 H) has share 1.
+    guard_x0 : float, optional
+        Value of P M at which s_guard reaches 0. Default 0.5.
     """
 
-    def __init__(self, indices, box, water_sites, sigma=0.3, n_ref_water=2.0):
+    def __init__(self, indices, box, water_sites, sigma=0.3, n_ref_water=2.0,
+                 pair_guard=False, n_hydronium=None, n_hydroxide=None, guard_width=0.8,
+                 guard_x0=0.5):
         super().__init__(indices, 3)
         self.box = np.asarray(box, dtype=float)
         self.water_sites = np.asarray(water_sites, dtype=np.int32)
         self.sigma = float(sigma)
         self.n_ref_water = float(n_ref_water)
         self.requires_box_unwrapping = False
+        self.pair_guard = bool(pair_guard)
+        self.n_hydronium = float(self.n_ref_water + 0.1 if n_hydronium is None else n_hydronium)
+        self.n_hydroxide = float(self.n_ref_water - 0.1 if n_hydroxide is None else n_hydroxide)
+        self.guard_width = float(guard_width)
+        self.guard_x0 = float(guard_x0)
+        if self.pair_guard:
+            if not (self.n_hydroxide < self.n_ref_water < self.n_hydronium):
+                raise ValueError("pair_guard: need n_hydroxide < n_ref_water < n_hydronium.")
+            if not (self.guard_width > 0.0 and self.guard_x0 > 0.0):
+                raise ValueError("pair_guard: guard_width and guard_x0 must be positive.")
+            if (self.n_hydronium + self.guard_width > self.n_ref_water + 1.0 + 1e-12
+                    or self.n_hydroxide - self.guard_width < self.n_ref_water - 1.0 - 1e-12):
+                raise ValueError("pair_guard: a full H3O+ / OH- must have share 1 "
+                                 "(n_hydronium + guard_width <= n_ref_water + 1 and "
+                                 "n_hydroxide - guard_width >= n_ref_water - 1).")
+
+    @property
+    def guard(self):
+        """Guard parameters for :func:`charge_separation` (None without the guard)."""
+        if not self.pair_guard:
+            return None
+        return (self.n_hydronium, self.n_hydroxide, self.guard_width, self.guard_x0)
 
     @property
     def function(self):
+        guard = self.guard
         return lambda r_h, r_sites, r_ref: charge_separation(
             r_h, r_sites, r_ref, self.box, self.water_sites, self.sigma,
-            self.n_ref_water)[0]
+            self.n_ref_water, guard)[0]
 
 
-def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water):
+def charge_pair_indicator(n_water, n_hydronium, n_hydroxide, guard_width):
+    """
+    Hydronium character P, hydroxide character M and their product P M (> 0 only
+    when the solvent holds a hydronium and a hydroxide at the same time, i.e. has
+    autoionised) from the H counts of the water oxygens.
+    """
+    P = np.sum(_smoothstep((n_water - n_hydronium) / guard_width))
+    M = np.sum(_smoothstep((n_hydroxide - n_water) / guard_width))
+    return P, M, P * M
+
+
+def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water,
+                      guard=None):
     """
     Value of :class:`ChargeSeparation` and the number of hydrogens owned by every
     owner site (returned for monitoring, e.g. protonation of other solute sites or
-    additional H3O+/OH- pairs in the solvent).
+    additional H3O+/OH- pairs in the solvent). `guard` = (n_hydronium, n_hydroxide,
+    guard_width, guard_x0) applies the autoionisation guard of
+    :class:`ChargeSeparation`; None (default) gives the plain CV.
     """
     def mic(d):
         return d - box * np.round(d / box)
@@ -864,7 +945,13 @@ def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water)
     r0 = r_ref[0] + np.mean(mic(r_ref - r_ref[0]), axis=0)
     d_w = np.sqrt(np.sum(mic(r_sites[water_sites] - r0) ** 2, axis=-1) + 1e-12)
 
-    return np.sum(q_water * d_w), n_owned
+    s = np.sum(q_water * d_w)
+    if guard is not None:
+        n_hydronium, n_hydroxide, guard_width, guard_x0 = guard
+        _, _, x = charge_pair_indicator(n_owned[water_sites], n_hydronium, n_hydroxide,
+                                        guard_width)
+        s = (1.0 - _smoothstep(x / guard_x0)) * s
+    return s, n_owned
 
 
 class IonSiteDistance(CollectiveVariable):
