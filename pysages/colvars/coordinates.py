@@ -871,11 +871,28 @@ class ChargeSeparation(CollectiveVariable):
         to 1. Default 0.8, so a full H3O+ (3 H) or OH- (1 H) has share 1.
     guard_x0 : float, optional
         Value of P M at which s_guard reaches 0. Default 0.5.
+    charge_sites : array-like of int, optional
+        Positions within the owner-site group whose charge enters s, with their
+        neutral H counts in `n_ref_sites`:
+
+            s = sum_i (n_i - n_ref_sites_i) |mic(r_i - r_ref)|,   i in charge_sites
+
+        Default None: the water oxygens with n_ref_water (the CV above). Including
+        the solute's other proton-owner sites (e.g. amide N, carbonyl O; not the
+        reference atoms) keeps s at the distance of the charge when a solvent ion
+        takes a proton from or gives one to such a site, instead of reading s ~ 0
+        (undissociated). With all solute sites neutral the extra terms are tiny: the
+        sites hold their neutral H count to ~1e-6 in prepared structures and to ~1e-4
+        in thermal frames (the Gaussian share of a hydrogen-bonded H, which the
+        water-only CV leaves as a fractional charge on the donor water), so s changes
+        by ~1e-4 A. The pair guard still looks at the waters only.
+    n_ref_sites : array-like of float, optional
+        Neutral H counts of the `charge_sites` (same length; required with them).
     """
 
     def __init__(self, indices, box, water_sites, sigma=0.3, n_ref_water=2.0,
                  pair_guard=False, n_hydronium=None, n_hydroxide=None, guard_width=0.8,
-                 guard_x0=0.5):
+                 guard_x0=0.5, charge_sites=None, n_ref_sites=None):
         super().__init__(indices, 3)
         self.box = np.asarray(box, dtype=float)
         self.water_sites = np.asarray(water_sites, dtype=np.int32)
@@ -897,6 +914,21 @@ class ChargeSeparation(CollectiveVariable):
                 raise ValueError("pair_guard: a full H3O+ / OH- must have share 1 "
                                  "(n_hydronium + guard_width <= n_ref_water + 1 and "
                                  "n_hydroxide - guard_width >= n_ref_water - 1).")
+        if (charge_sites is None) != (n_ref_sites is None):
+            raise ValueError("charge_sites and n_ref_sites must be given together.")
+        self.charge_sites = self.n_ref_sites = None
+        if charge_sites is not None:
+            sites = np.asarray(charge_sites, dtype=np.int32).ravel()
+            n_ref = np.asarray(n_ref_sites, dtype=float).ravel()
+            n_owner = len(self.groups[1])
+            if len(n_ref) != len(sites):
+                raise ValueError("charge_sites and n_ref_sites must have the same length.")
+            if (len(sites) == 0 or len(np.unique(sites)) != len(sites)
+                    or int(sites.min()) < 0 or int(sites.max()) >= n_owner):
+                raise ValueError("charge_sites must be distinct positions within the "
+                                 "owner-site group.")
+            self.charge_sites = sites
+            self.n_ref_sites = n_ref
 
     @property
     def guard(self):
@@ -908,9 +940,12 @@ class ChargeSeparation(CollectiveVariable):
     @property
     def function(self):
         guard = self.guard
+        # getattr: CVs pickled before charge_sites existed carry the waters only
+        charge_sites = getattr(self, "charge_sites", None)
+        n_ref_sites = getattr(self, "n_ref_sites", None)
         return lambda r_h, r_sites, r_ref: charge_separation(
             r_h, r_sites, r_ref, self.box, self.water_sites, self.sigma,
-            self.n_ref_water, guard)[0]
+            self.n_ref_water, guard, charge_sites, n_ref_sites)[0]
 
 
 def charge_pair_indicator(n_water, n_hydronium, n_hydroxide, guard_width):
@@ -925,25 +960,30 @@ def charge_pair_indicator(n_water, n_hydronium, n_hydroxide, guard_width):
 
 
 def charge_separation(r_h, r_sites, r_ref, box, water_sites, sigma, n_ref_water,
-                      guard=None):
+                      guard=None, charge_sites=None, n_ref_sites=None):
     """
     Value of :class:`ChargeSeparation` and the number of hydrogens owned by every
     owner site (returned for monitoring, e.g. protonation of other solute sites or
     additional H3O+/OH- pairs in the solvent). `guard` = (n_hydronium, n_hydroxide,
     guard_width, guard_x0) applies the autoionisation guard of
-    :class:`ChargeSeparation`; None (default) gives the plain CV.
+    :class:`ChargeSeparation`; None (default) gives the plain CV. `charge_sites` /
+    `n_ref_sites`: the sites whose charge enters s and their neutral H counts
+    (default None: the water sites with n_ref_water).
     """
     def mic(d):
         return d - box * np.round(d / box)
 
+    if charge_sites is None:
+        charge_sites, n_ref_sites = water_sites, n_ref_water
+
     # Gaussian sharing of every hydrogen among all owner sites (rows sum to one)
     d2 = np.sum(mic(r_h[:, None, :] - r_sites[None, :, :]) ** 2, axis=-1)
     n_owned = np.sum(jax.nn.softmax(-d2 / (2.0 * sigma**2), axis=1), axis=0)
-    q_water = n_owned[water_sites] - n_ref_water
+    q_water = n_owned[charge_sites] - n_ref_sites
 
     # reference point: centroid of the reference atoms, made whole around the first one
     r0 = r_ref[0] + np.mean(mic(r_ref - r_ref[0]), axis=0)
-    d_w = np.sqrt(np.sum(mic(r_sites[water_sites] - r0) ** 2, axis=-1) + 1e-12)
+    d_w = np.sqrt(np.sum(mic(r_sites[charge_sites] - r0) ** 2, axis=-1) + 1e-12)
 
     s = np.sum(q_water * d_w)
     if guard is not None:
